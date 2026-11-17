@@ -39,3 +39,7 @@ The build packages come in as the apk virtual package `.s24-pa-build`; `apk del 
 - `tests/audio/ack-analyze.sh`: counts writes that don't line up with a period
 
 No speaker calibration exists on this unit (`/efs/cirrus` missing); the amps' protection firmware runs anyway.
+
+## Sound on a USB-C monitor
+
+The DisplayPort PCM (`hw:0,31`) and the sink `s24-dockd` adds for it: see [usb-c-display.md](usb-c-display.md#sound-on-the-monitor).

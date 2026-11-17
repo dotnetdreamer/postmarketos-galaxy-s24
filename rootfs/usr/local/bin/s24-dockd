@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""s24-dockd: Plasma Mobile's docked mode while a monitor is on the USB-C port.
+"""s24-dockd: the phone as a desktop while a monitor is on the USB-C port.
 
 Galaxy S24, postmarketOS (Claude, 2026-11-17). Runs in the desktop session, started by
-/etc/xdg/autostart/s24-dock.desktop.
+/etc/xdg/autostart/s24-dock.desktop. While a monitor is connected:
 
-Plasma Mobile shows every app full screen and without a title bar, on every screen, unless
-its Docked mode is on (the quick setting; convergenceModeEnabled in plasmamobilerc's
-[General]). On a monitor you want windows you can move. So while a monitor is connected,
-docked mode is on, and when the monitor goes, docked mode goes back to what the phone had.
-The same rules as Open Android DeX's postmarketOS helper:
-
+Windows you can move. Plasma Mobile shows every app full screen and without a title bar, on
+every screen, unless its Docked mode is on (the quick setting; convergenceModeEnabled in
+plasmamobilerc's [General]). So docked mode is on while a monitor is connected, and when the
+monitor goes it goes back to what the phone had. The same rules as Open Android DeX's
+postmarketOS helper:
 - What the phone had is kept in ~/.cache/s24-dock/docked-before until it is put back, so a
   restart or a flat battery while docked still puts it back at the next login
 - A phone that had docked mode on already is left alone
 - Writing the setting is not enough: plasma-mobile-envmanager --apply-settings gives KWin
   docked mode's rules (windows can be dragged, open centred, have title bar buttons), as
   Plasma Mobile's own switch does
+
+Sound on the monitor. The Exynos sound card has a PCM straight to the DisplayPort link
+("DP0 Audio", hw:0,31; Samsung's dp_dma driver). It only opens once the display driver has
+read the monitor's audio support from its EDID and turned the picture on. If the monitor's
+EDID says it plays sound, a PulseAudio sink for that PCM is added (named after the monitor),
+made the default and given the streams that are playing; the default from before is kept
+in ~/.cache/s24-dock/sink-before and put back when the monitor goes (the sink is removed
+and PulseAudio moves its streams on). Picking another output while docked is left alone.
 
 Monitor changes come from the kernel's DRM hotplug events (netlink, no polling); whether a
 monitor is there is read from /sys/class/drm/card*-DP-*/status (USB-C) and HDMI-*. One copy
@@ -34,8 +41,15 @@ from gi.repository import Gio, GLib
 NAME = "org.postmarketos.s24.Dock"
 STATE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "s24-dock")
 BEFORE = os.path.join(STATE, "docked-before")
+SINK_BEFORE = os.path.join(STATE, "sink-before")
 LOG = os.path.join(STATE, "s24-dockd.log")
 KEY = ["--file", "plasmamobilerc", "--group", "General", "--key", "convergenceModeEnabled"]
+
+DISPLAY_SINK = "s24_display"
+DISPLAY_PCM = "hw:0,31"  # "DP0 Audio"
+# As the speaker's sink (/etc/pulse/default.pa.d/s24-sound.pa), with 20 ms periods
+DISPLAY_SINK_ARGS = ["device=" + DISPLAY_PCM, "sink_name=" + DISPLAY_SINK, "mmap=false", "tsched=false",
+                     "fragments=4", "fragment_size=3840", "rate=48000", "channels=2", "format=s16le"]
 
 
 def log(msg):
@@ -46,16 +60,66 @@ def log(msg):
         pass
 
 
+def write_file(path, text):
+    os.makedirs(STATE, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text + "\n")
+
+
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+# ── the monitor ──────────────────────────────────────────────────────────
+
+def connectors():
+    return glob.glob("/sys/class/drm/card*-DP-*") + glob.glob("/sys/class/drm/card*-HDMI-*")
+
+
 def monitor_connected():
-    for status in glob.glob("/sys/class/drm/card*-DP-*/status") + glob.glob("/sys/class/drm/card*-HDMI-*/status"):
-        try:
-            with open(status) as f:
-                if f.read().strip() == "connected":
-                    return True
-        except OSError:
-            pass
+    for c in connectors():
+        if read_file(c + "/status") == "connected":
+            return True
     return False
 
+
+def monitor_edid():
+    for c in connectors():
+        if read_file(c + "/status") == "connected":
+            try:
+                with open(c + "/edid", "rb") as f:
+                    return f.read()
+            except OSError:
+                pass
+    return b""
+
+
+def monitor_name():
+    e = monitor_edid()
+    for off in range(54, 126, 18):  # the base block's descriptors; 0xFC = product name
+        d = e[off:off + 18]
+        if len(d) == 18 and d[:2] == b"\0\0" and d[3] == 0xFC:
+            name = d[5:].split(b"\n")[0].decode("ascii", "replace").strip()
+            name = "".join(c for c in name if c.isalnum() or c in " -_.+")
+            if name:
+                return name
+    return "Monitor"
+
+
+def monitor_has_audio():
+    e = monitor_edid()
+    for b in range(1, len(e) // 128):
+        block = e[b * 128:(b + 1) * 128]
+        if block[0] == 0x02 and block[3] & 0x40:  # CEA-861 extension, "basic audio"
+            return True
+    return False
+
+
+# ── docked mode ──────────────────────────────────────────────────────────
 
 def docked():
     r = subprocess.run(["kreadconfig6"] + KEY, capture_output=True, text=True)
@@ -86,9 +150,7 @@ def dock():
         log("monitor connected: docked mode was on already, left alone")
         return
     try:
-        os.makedirs(STATE, exist_ok=True)
-        with open(BEFORE, "w") as f:
-            f.write("false\n")
+        write_file(BEFORE, "false")
     except OSError as e:
         log("monitor connected: docked mode left off (nowhere to keep what the phone had: %s)" % e)
         return
@@ -99,18 +161,93 @@ def dock():
 def undock():
     if not os.path.exists(BEFORE):
         return
-    with open(BEFORE) as f:
-        before = f.read().strip() == "true"
+    before = read_file(BEFORE) == "true"
     if set_docked(before):
         os.unlink(BEFORE)
         log("monitor gone: docked mode back %s, as the phone had it" % ("on" if before else "off"))
 
 
+# ── sound ────────────────────────────────────────────────────────────────
+
+def pactl(*args):
+    try:
+        r = subprocess.run(["pactl"] + list(args), capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return 1, ""
+    return r.returncode, r.stdout
+
+
+def display_module(modules_out):
+    for line in modules_out.splitlines():
+        f = line.split("\t")
+        if len(f) >= 3 and f[1] == "module-alsa-sink" and ("sink_name=" + DISPLAY_SINK) in f[2].split():
+            return f[0]
+    return None
+
+
+def sink_names():
+    rc, out = pactl("list", "short", "sinks")
+    return [line.split("\t")[1] for line in out.splitlines() if "\t" in line] if rc == 0 else []
+
+
+def sound_on():
+    """Sound to the monitor. False: try again later (PulseAudio not up, audio not announced yet)."""
+    rc, out = pactl("list", "short", "modules")
+    if rc != 0:
+        return False
+    if display_module(out) is not None:
+        return True  # there already; if the user picked another output since, that stays
+    # The default before the monitor: read it first, module-switch-on-connect moves it at once
+    rc, before = pactl("get-default-sink")
+    before = before.strip() if rc == 0 else ""
+    name = monitor_name()
+    props = "device.description='%s' device.icon_name='video-display'" % name
+    rc, _ = pactl("load-module", "module-alsa-sink", *DISPLAY_SINK_ARGS, 'sink_properties="%s"' % props)
+    if rc != 0:
+        return False
+    if before and before != DISPLAY_SINK and not os.path.exists(SINK_BEFORE):
+        try:
+            write_file(SINK_BEFORE, before)
+        except OSError:
+            pass
+    pactl("set-default-sink", DISPLAY_SINK)
+    rc, out = pactl("list", "short", "sink-inputs")
+    for line in out.splitlines() if rc == 0 else []:
+        pactl("move-sink-input", line.split("\t")[0], DISPLAY_SINK)
+    log("monitor connected: sound to %s" % name)
+    return True
+
+
+def sound_off():
+    rc, out = pactl("list", "short", "modules")
+    if rc != 0:
+        return
+    module = display_module(out)
+    if module is None:
+        return
+    pactl("unload-module", module)  # PulseAudio moves its streams to the next default
+    before = read_file(SINK_BEFORE)
+    if before and before in sink_names():
+        pactl("set-default-sink", before)
+    try:
+        os.unlink(SINK_BEFORE)
+    except OSError:
+        pass
+    log("monitor gone: sound back to %s" % (before or "the default output"))
+
+
+# ── both ─────────────────────────────────────────────────────────────────
+
 def sync():
+    """Bring everything in line with the monitor. Returns False when sound should be retried."""
     if monitor_connected():
         dock()
-    else:
-        undock()
+        if not monitor_has_audio():
+            return True
+        return sound_on()
+    undock()
+    sound_off()
+    return True
 
 
 def main():
@@ -131,12 +268,25 @@ def main():
     # Kernel uevents: an unprivileged process may listen (NETLINK_KOBJECT_UEVENT, group 1).
     uevents = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 15)
     uevents.bind((0, 1))
-    pending = [0]
+    timer = {"id": 0, "retries": 0}
 
-    def settled():
-        pending[0] = 0
-        sync()
+    def run():
+        timer["id"] = 0
+        if sync():
+            timer["retries"] = 0
+        elif timer["retries"] < 20:  # the sound comes some time after the picture, PulseAudio after login
+            timer["retries"] += 1
+            timer["id"] = GLib.timeout_add(3000, run)
+        else:
+            log("monitor connected, but its sound couldn't be set up (tried for a minute)")
+            timer["retries"] = 0
         return False
+
+    def later(ms):
+        if timer["id"]:
+            GLib.source_remove(timer["id"])
+        timer["retries"] = 0
+        timer["id"] = GLib.timeout_add(ms, run)
 
     def on_uevent(fd, cond):
         try:
@@ -144,16 +294,18 @@ def main():
         except OSError:
             return True
         if b"\0SUBSYSTEM=drm\0" in msg:
-            # a plug comes as several events and KWin needs a moment: check once it is quiet
-            if pending[0]:
-                GLib.source_remove(pending[0])
-            pending[0] = GLib.timeout_add(1500, settled)
+            later(1500)  # a plug comes as several events and KWin needs a moment: check once it is quiet
+        return True
+
+    def heal():
+        if not timer["id"]:
+            run()
         return True
 
     GLib.io_add_watch(uevents.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_uevent)
-    GLib.timeout_add_seconds(60, lambda: (sync(), True)[1])  # a missed event heals within a minute
+    GLib.timeout_add_seconds(60, heal)  # a missed event heals within a minute
     log("started (monitor %s)" % ("connected" if monitor_connected() else "not connected"))
-    sync()
+    run()
     loop.run()
     log("stopped")
     return 0

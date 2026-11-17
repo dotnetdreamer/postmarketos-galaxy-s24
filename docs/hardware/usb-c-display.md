@@ -1,6 +1,6 @@
 # USB-C monitors and docks
 
-**State:** works. A USB-C monitor or dock shows the desktop as a second screen and charges the phone at the same time, with windows you can move (docked mode turns on by itself). The dock's USB ports work too: keyboard, mouse, wired network.
+**State:** works. A USB-C monitor or dock shows the desktop as a second screen and charges the phone at the same time, with windows you can move (docked mode turns on by itself) and the sound on the monitor's speakers. The dock's USB ports work too: keyboard, mouse, wired network.
 
 Tested with a Dell WD19DCS dock and a 2560x1440 monitor:
 
@@ -57,10 +57,25 @@ Plasma Mobile shows every app full screen without a title bar, on every screen, 
 - Windows that were open before the switch keep their size; drag the title bar (or a browser's tab bar) to make them movable windows. New windows open centred
 - Log: `~/.cache/s24-dock/s24-dockd.log`
 
-Checked on the phone: started with the dock connected, it turned docked mode on, KWin got the docked rules, and an open dialog got a title bar. Not checked yet: unplugging and plugging back in (docked mode off and on again).
+Checked on the phone: started with the dock connected, it turned docked mode on, KWin got the docked rules, and an open dialog got a title bar. When the monitor dropped and came back by itself (20:33 in its log), docked mode went off and on again.
+
+## Sound on the monitor
+
+The Exynos sound card has a PCM that goes straight to the DisplayPort link: `hw:0,31`, "DP0 Audio" (Samsung's `dp_dma` driver, `snd_soc_dp_dma`). It opens only after the display driver has read the monitor's audio support from its EDID and turned the picture on (`/proc/dplog` then shows `audio info = 0x...`; before that, opening it fails with `EIO`). It takes 16 or 24 bit, 1 to 8 channels; the monitor's EDID says what it plays (stereo PCM up to 48 kHz here).
+
+`s24-dockd` adds a PulseAudio sink for it while a monitor with sound (EDID "basic audio") is connected:
+
+- `module-alsa-sink device=hw:0,31 sink_name=s24_display`, the same settings as the speaker's sink (`mmap=false tsched=false`, 48 kHz, s16le) with 20 ms periods, named after the monitor (`H32S17` here)
+- It becomes the default and takes the streams that are playing. The default from before is read first (postmarketOS's `module-switch-on-connect` moves it the moment the sink appears) and kept in `~/.cache/s24-dock/sink-before`
+- When the monitor goes, the sink is removed (PulseAudio moves its streams on) and the old default is put back, so headphones that were the default come back, not the speaker
+- Picking another output while docked is left alone
+- The sound comes a moment after the picture and PulseAudio starts after login: it retries every 3 s for a minute
+
+The `DP AUDIO0 Rate/Width/Channel` mixer controls read 0 and don't matter for playback.
+
+Checked on the phone: a tone straight to `hw:0,31`, and one through PulseAudio with the display sink as the default (`RUNNING`, the speaker's sink suspended, the display driver logging `audio_enable:1, ch:2, fs:2`). `tests/usb-c/dockd-logic-test.py` checks the switching rules against a stand-in `pactl` (30 checks).
 
 ## Not done
 
-- Sound through the monitor (DisplayPort audio): not tried
 - The Realtek network chip asks for a firmware patch (`rtl_nic/rtl8153b-2.fw`) that the phone doesn't have. It works without it
 - Not tested since this change: the phone on a PC's USB port (the rescue network on `usb0`). The fix lets Samsung's USB code finish its boot steps, which on Android also run with a PC attached
