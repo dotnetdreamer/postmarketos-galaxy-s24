@@ -3,7 +3,7 @@
 **State:**
 - Mobile data works (LTE, 78 to 135 Mbit/s measured), with signal bars and the data switch in Plasma Mobile
 - SMS: code done, checked over D-Bus, not yet tested with a real message
-- Calls: dial, answer, hang up and DTMF work over D-Bus (GNOME Calls sees a normal modem); the in-call voice path is reverse engineered but not built, so a call has no sound yet
+- Calls work, including two-way voice (tested on a real call, both directions). Dial, answer, hang up and DTMF go over D-Bus (GNOME Calls sees a normal modem); the call sound is handled by `s24-callaudio` on the Linux side alone
 
 ## Design
 
@@ -34,7 +34,7 @@ The real ModemManager can't drive this modem; `rootfs/usr/local/share/dbus-1/sys
 | `rootfs/usr/local/share/s24/init.s24.rc`, `cgroup.rc`, `apex-info-list.xml` | The container's only init script, a hand-written cgroup description, the APEX list for its linker config |
 | `rootfs/usr/local/sbin/s24-mmd-run`, `rootfs/etc/init.d/s24-mmd` | Boot service: starts the container if needed, then `s24-mmd` |
 | `rootfs/usr/local/sbin/s24-mobile-data-hook`, `rootfs/etc/NetworkManager/dispatcher.d/90-s24-mobile-data` | DNS fallback and CLAT (IPv4 on IPv6-only networks) |
-| `src/callaudio/` | Call audio: what Samsung's audio HAL does around a call (mixer route, modem audio commands), mapped from its libraries; `s24-callaudio.py` sets the Linux side |
+| `src/callaudio/` | Call audio. `s24-callaudio.py` does on Linux what Samsung's audio HAL does around a call: sets the ABOX DSP to in-call mode, applies the stock in-call mixer route (read from the vendor `mixer_paths.xml`), and opens the loop PCM nodes (`hw:0,104` Rx, `hw:0,123` Tx, `hw:0,131` echo-ref). The `s24-mmd` bridge runs it automatically for the duration of each call and tears it down after, restoring the normal media route. **The modem feeds the call PCM into the ABOX link by itself when a call is active**, so opening those nodes is enough for two-way voice, no modem-side audio command is needed. `HAL-CALL-SEQUENCE.md` is the reverse-engineered stock sequence |
 
 `s24-mobile-data` (the older data-only service) is kept but not enabled.
 

@@ -19,7 +19,7 @@ This repository has everything that made it work: the boot ramdisk, the postmark
 | Bluetooth | Works | Scanning works and it survives sleep; pairing with real headphones not tested yet |
 | Mobile data | Works | LTE through ModemManager's interface, signal bars in Plasma, IPv6-only carriers handled (IPv4 through CLAT) |
 | SMS | Partly | Code done and checked on D-Bus, not yet tested with a real message |
-| Phone calls | Partly | Dial, answer and hang up work on D-Bus; the in-call voice path is mapped but not built |
+| Phone calls | Works | Dial, answer, hang up, DTMF, and two-way voice (tested on a real call); the Linux audio side is enough, the modem feeds the call sound in by itself |
 | Sensors | Works | Rotation, light and proximity through Samsung's sensor hub |
 | Double tap to wake | Works | |
 | Deep sleep | Works | Sleeps with the screen off, wakes on power key, double tap, Wi-Fi or alarms |
