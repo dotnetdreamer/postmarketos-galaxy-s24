@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Monitor docking
+Comment=Plasma Mobile's docked mode (movable windows) while a monitor is on the USB-C port
+Exec=/usr/local/bin/s24-dockd
+NoDisplay=true
+OnlyShowIn=KDE;

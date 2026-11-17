@@ -1,6 +1,6 @@
 # USB-C monitors and docks
 
-**State:** works. A USB-C monitor or dock shows the desktop as a second screen and charges the phone at the same time. The dock's USB ports work too: keyboard, mouse, wired network.
+**State:** works. A USB-C monitor or dock shows the desktop as a second screen and charges the phone at the same time, with windows you can move (docked mode turns on by itself). The dock's USB ports work too: keyboard, mouse, wired network.
 
 Tested with a Dell WD19DCS dock and a 2560x1440 monitor:
 
@@ -46,10 +46,18 @@ kscreen-doctor -o                              # in the desktop session: DP-1 en
 
 To see what the monitor shows from a shell: `src/tools/fbgrab.c` on the plane that scans out 2560x1440 (try plane ids until one reports that size).
 
-## Using it
+## Windows you can move (docked mode)
 
-- Plasma Mobile puts its home screen on the monitor. For windows like on a desktop, turn on **Docked mode** in the quick settings
-- Unplugging and plugging back in after boot was not tested yet; on Android that is the normal path, so it is expected to work
+Plasma Mobile shows every app full screen without a title bar, on every screen, unless its **Docked mode** is on (the quick setting; `convergenceModeEnabled` in `plasmamobilerc`). So `rootfs/usr/local/bin/s24-dockd` turns it on while a monitor is connected and puts back what the phone had when the monitor goes, the same way Open Android DeX's postmarketOS helper does for a computer's screen:
+
+- It runs in the desktop session (`rootfs/etc/xdg/autostart/s24-dock.desktop`, Plasma Mobile only) and listens for the kernel's DRM hotplug events; whether a monitor is there comes from `/sys/class/drm/card*-DP-*/status`
+- Writing the setting is not enough: it also runs `plasma-mobile-envmanager --apply-settings`, as Plasma Mobile's own switch does, which gives KWin docked mode's rules (`InteractiveWindowMoveEnabled=true`, `Placement=Centered`, no borderless maximized windows in `~/.config/plasma-mobile/kwinrc`). Without it windows can't be dragged
+- What the phone had is kept in `~/.cache/s24-dock/docked-before` until it is put back, so a restart while docked still puts it back at the next login. A phone that had docked mode on already is left alone
+- Docked mode is one setting for all screens: while the monitor is connected, the phone's own screen has windows with title bars too
+- Windows that were open before the switch keep their size; drag the title bar (or a browser's tab bar) to make them movable windows. New windows open centred
+- Log: `~/.cache/s24-dock/s24-dockd.log`
+
+Checked on the phone: started with the dock connected, it turned docked mode on, KWin got the docked rules, and an open dialog got a title bar. Not checked yet: unplugging and plugging back in (docked mode off and on again).
 
 ## Not done
 

@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""s24-dockd: Plasma Mobile's docked mode while a monitor is on the USB-C port.
+
+Galaxy S24, postmarketOS (Claude, 2026-11-17). Runs in the desktop session, started by
+/etc/xdg/autostart/s24-dock.desktop.
+
+Plasma Mobile shows every app full screen and without a title bar, on every screen, unless
+its Docked mode is on (the quick setting; convergenceModeEnabled in plasmamobilerc's
+[General]). On a monitor you want windows you can move. So while a monitor is connected,
+docked mode is on, and when the monitor goes, docked mode goes back to what the phone had.
+The same rules as Open Android DeX's postmarketOS helper:
+
+- What the phone had is kept in ~/.cache/s24-dock/docked-before until it is put back, so a
+  restart or a flat battery while docked still puts it back at the next login
+- A phone that had docked mode on already is left alone
+- Writing the setting is not enough: plasma-mobile-envmanager --apply-settings gives KWin
+  docked mode's rules (windows can be dragged, open centred, have title bar buttons), as
+  Plasma Mobile's own switch does
+
+Monitor changes come from the kernel's DRM hotplug events (netlink, no polling); whether a
+monitor is there is read from /sys/class/drm/card*-DP-*/status (USB-C) and HDMI-*. One copy
+per session: the newest takes the session bus name and an older one quits. It quits with
+the session. Log: ~/.cache/s24-dock/s24-dockd.log
+"""
+import glob
+import os
+import socket
+import subprocess
+import sys
+import time
+
+from gi.repository import Gio, GLib
+
+NAME = "org.postmarketos.s24.Dock"
+STATE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "s24-dock")
+BEFORE = os.path.join(STATE, "docked-before")
+LOG = os.path.join(STATE, "s24-dockd.log")
+KEY = ["--file", "plasmamobilerc", "--group", "General", "--key", "convergenceModeEnabled"]
+
+
+def log(msg):
+    try:
+        with open(LOG, "a") as f:
+            f.write(time.strftime("%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def monitor_connected():
+    for status in glob.glob("/sys/class/drm/card*-DP-*/status") + glob.glob("/sys/class/drm/card*-HDMI-*/status"):
+        try:
+            with open(status) as f:
+                if f.read().strip() == "connected":
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def docked():
+    r = subprocess.run(["kreadconfig6"] + KEY, capture_output=True, text=True)
+    return r.stdout.strip() == "true"
+
+
+def set_docked(on):
+    value = "true" if on else "false"
+    if subprocess.run(["kwriteconfig6", "--notify"] + KEY + [value]).returncode != 0:
+        log("kwriteconfig6 failed, docked mode not changed")
+        return False
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")  # as startplasmamobile runs it
+    env.pop("XDG_ACTIVATION_TOKEN", None)
+    env.pop("DESKTOP_STARTUP_ID", None)
+    r = subprocess.run(["plasma-mobile-envmanager", "--apply-settings"], env=env,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0:
+        log("plasma-mobile-envmanager failed: KWin may keep the old window rules")
+    return True
+
+
+def dock():
+    if os.path.exists(BEFORE):  # turned on by us already (maybe before a restart)
+        if not docked():
+            set_docked(True)
+        return
+    if docked():
+        log("monitor connected: docked mode was on already, left alone")
+        return
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(BEFORE, "w") as f:
+            f.write("false\n")
+    except OSError as e:
+        log("monitor connected: docked mode left off (nowhere to keep what the phone had: %s)" % e)
+        return
+    if set_docked(True):
+        log("monitor connected: docked mode on (the phone had it off)")
+
+
+def undock():
+    if not os.path.exists(BEFORE):
+        return
+    with open(BEFORE) as f:
+        before = f.read().strip() == "true"
+    if set_docked(before):
+        os.unlink(BEFORE)
+        log("monitor gone: docked mode back %s, as the phone had it" % ("on" if before else "off"))
+
+
+def sync():
+    if monitor_connected():
+        dock()
+    else:
+        undock()
+
+
+def main():
+    if not os.environ.get("PLASMA_PLATFORM", "").startswith("phone"):
+        return 0  # Plasma Mobile only (Phosh docks by itself)
+    os.makedirs(STATE, exist_ok=True)
+    try:
+        if os.path.getsize(LOG) > 65536:
+            os.unlink(LOG)
+    except OSError:
+        pass
+
+    loop = GLib.MainLoop()
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)  # the process ends when the session's bus goes
+    Gio.bus_own_name_on_connection(bus, NAME, Gio.BusNameOwnerFlags.ALLOW_REPLACEMENT | Gio.BusNameOwnerFlags.REPLACE,
+                                   None, lambda *a: loop.quit())
+
+    # Kernel uevents: an unprivileged process may listen (NETLINK_KOBJECT_UEVENT, group 1).
+    uevents = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, 15)
+    uevents.bind((0, 1))
+    pending = [0]
+
+    def settled():
+        pending[0] = 0
+        sync()
+        return False
+
+    def on_uevent(fd, cond):
+        try:
+            msg = uevents.recv(16384)
+        except OSError:
+            return True
+        if b"\0SUBSYSTEM=drm\0" in msg:
+            # a plug comes as several events and KWin needs a moment: check once it is quiet
+            if pending[0]:
+                GLib.source_remove(pending[0])
+            pending[0] = GLib.timeout_add(1500, settled)
+        return True
+
+    GLib.io_add_watch(uevents.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN, on_uevent)
+    GLib.timeout_add_seconds(60, lambda: (sync(), True)[1])  # a missed event heals within a minute
+    log("started (monitor %s)" % ("connected" if monitor_connected() else "not connected"))
+    sync()
+    loop.run()
+    log("stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

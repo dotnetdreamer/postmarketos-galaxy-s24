@@ -12,6 +12,7 @@ What it needed beyond the GPU setup ([display-and-gpu.md](display-and-gpu.md)):
 - `s24-greeter-reaper` (service): the login screen leaves about 35 processes behind after every login; this kills them once the greeter session has ended
 - The on-screen keyboard is `plasma-keyboard`. Don't accept "IBus Preferences" (it replaces the keyboard); `~/.local/share/applications/org.freedesktop.IBus.Setup.desktop` hides it in Plasma
 - GTK apps' window buttons per session: `rootfs/home/user/.config/autostart/s24-gtk-buttons-*.desktop`
+- Docked mode (movable windows) while a monitor is on the USB-C port: `rootfs/usr/local/bin/s24-dockd`, see [usb-c-display.md](usb-c-display.md)
 - Log out cleanly with `qdbus6 org.kde.Shutdown /Shutdown org.kde.Shutdown.logout` (session bus); killing KWin leaves no shell
 
 ## Apps that are too wide for the phone
