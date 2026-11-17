@@ -1,0 +1,27 @@
+# Local bring-up package for the Galaxy S24 (Exynos 2400), not for upstream.
+pkgname=device-samsung-e1s
+pkgdesc="Samsung Galaxy S24 (Exynos)"
+pkgver=1
+pkgrel=0
+url="https://postmarketos.org"
+license="MIT"
+arch="aarch64"
+options="!check !archcheck"
+depends="
+	linux-samsung-e1s
+	postmarketos-base
+	postmarketos-base-downstream
+"
+makedepends="devicepkg-dev"
+source="deviceinfo"
+
+build() {
+	devicepkg_build $startdir $pkgname
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+}
+sha512sums="
+5d154ae21b6b9db6d6692d6dae8c84c9f21ffd6fff5fd05c64950f5d026e2d177b1467f6f602e7c85fa6032bf288a3ba4f58f54eae74b8601ef9dc7896b1c3ec  deviceinfo
+"

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): the s24-mobile-data service's supervised program.
+# Starts the Android modem container if it isn't running, waits for rild, then becomes s24-radio
+# (which keeps the data call up). Runs in the background, so boot doesn't wait for the modem.
+# The container has to start from the boot shell's root, not postmarketOS's (see android-ctr0.sh):
+# it is reached through the root of a process that lives there (stage-0's USB telnetd/udhcpd).
+APN=${APN:-auto}
+SLOT=${SLOT:-1}
+
+boot_root() {
+	for p in /proc/[0-9]*; do
+		[ -d "$p/root/newroot/usr/local/sbin" ] && { echo "$p/root"; return 0; }
+	done
+	return 1
+}
+
+if ! pgrep -f 'init second_stage' >/dev/null; then
+	r=$(boot_root) || { echo "s24-mobile-data: the boot shell's root was not found"; exit 1; }
+	echo "s24-mobile-data: starting the Android modem container"
+	chroot "$r" sh /newroot/usr/local/sbin/android-ctr0.sh start radio || exit 1
+fi
+i=0
+until S24_SLOT=$SLOT timeout 10 /usr/local/bin/s24-radio net >/dev/null 2>&1; do
+	i=$((i + 1))
+	[ $i -ge 30 ] && { echo "s24-mobile-data: rild did not come up"; exit 1; }
+	sleep 2
+done
+exec env S24_RADIO_HOOK=/usr/local/sbin/s24-mobile-data-hook S24_SLOT="$SLOT" \
+	/usr/local/bin/s24-radio data "$APN"

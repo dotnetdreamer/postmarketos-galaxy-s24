@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): screen-off power handling like Android's: the
+# touch chip's low-power double-tap mode while the screen is dark, and deep sleep a few seconds
+# after the screen goes dark. Program: /usr/local/sbin/s24-powerd, settings: /etc/s24-power.conf
+description="Galaxy S24 screen-off power: double-tap wake and deep sleep"
+supervisor=supervise-daemon
+command=/usr/local/sbin/s24-powerd
+output_log=/var/log/s24-power.log
+error_log=/var/log/s24-power.log
+respawn_delay=2
+respawn_max=5
+
+depend() {
+	need dbus elogind
+	after s24-sensors
+}
+
+start_pre() {
+	f=/var/log/s24-power.log
+	[ -f $f ] && [ "$(wc -c < $f)" -gt 1000000 ] && : > $f
+	return 0
+}

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=GTK window buttons in Phosh
+Comment=Phosh's own layout (no buttons) back after a Plasma session (S24, 2026-11-15)
+Exec=gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:'
+OnlyShowIn=Phosh;GNOME;
+NoDisplay=true

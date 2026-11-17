@@ -1,0 +1,16 @@
+# Galaxy S24 speakers and microphone (Claude, 2026-11-15), on the ABOX DSP's virtual PCMs:
+# "calliope_0" (hw:0,100) plays, "calliope_20" (hw:0,120) records the main microphone.
+# /etc/local.d/s24-audio.start sets their routes at boot. Two firmware rules decide the settings:
+# it ignores a stream whose period is longer than 20 ms ("NO SCHEDULED"), and for playback it only
+# learns about new data from write() calls (an mmap'ed stream never moves). So: no mmap, no timer
+# scheduling, 10 ms periods (480 frames).
+# It also books every write as one whole period, so PulseAudio has to write whole periods
+# (libalsa-util.so patched, /usr/local/share/s24/pa-whole-periods.patch) and must not rewind: the
+# DSP has already taken what PulseAudio would rewrite (rewind_safeguard = the whole buffer).
+# Otherwise its mixer overflows, drains and plays silence: audible stutter (2026-11-15).
+.nofail
+load-module module-alsa-sink device=hw:0,100 sink_name=s24_speaker mmap=false tsched=false fragments=4 fragment_size=1920 rewind_safeguard=7680 rate=48000 channels=2 format=s16le sink_properties="device.description='Speaker' device.icon_name='audio-speakers' device.form_factor='internal'"
+load-module module-alsa-source device=hw:0,120 source_name=s24_mic mmap=false tsched=false fragments=4 fragment_size=960 rate=48000 channels=1 format=s16le source_properties="device.description='Microphone' device.icon_name='audio-input-microphone' device.form_factor='internal'"
+set-default-sink s24_speaker
+set-default-source s24_mic
+.fail

@@ -1,0 +1,329 @@
+#!/bin/busybox sh
+# Galaxy S24 (SM-S921B, e1s) bring-up init, stage 0 v15 (Claude, 2026-11-14).
+# Runs instead of Android's first-stage init (flashed to init_boot; the bootloader puts this ramdisk
+# after the stock vendor_boot ramdisk, whose /lib/modules holds the first-stage modules).
+#
+# History: v1-v4 and both C probes all ended in Upload mode. v5 finding: every one of those ramdisks
+# was gzip. The stock vendor ramdisk is lz4 legacy, and the bootloader puts this ramdisk right after
+# it; the kernel's lz4 reader then takes the gzip header as one more lz4 chunk, fails, and this
+# ramdisk is never unpacked (no /init: panic). TWRP's e1s tree forces lz4 for the same reason. v5 is
+# packed as lz4 legacy (lz4 -l), like Android's own ramdisks. Kept from v4:
+#  - takes modules.load entries with or without ".ko", loads them at once in Android's order
+#  - feeds /dev/watchdog like Android's "watchdogd 10 20" (30 s timeout, fed every 10 s), and any
+#    other watchdog device; hung-task detection off (as TWRP's e1s init does)
+#  - with /probe in the ramdisk: loads the first modules (up to the watchdog driver) and reboots with
+#    reason "download", to prove this init runs (Download mode = yes); the PC then flashes the image
+#    without /probe
+#  - without host traffic on the USB network 180 s after the modules, reboots to Download mode too
+#  - trail in /dev/pmsg0 (survives a warm reboot); a module that crashed the previous boot is skipped
+#  - USB networking as soon as a USB device controller exists: phone 172.16.42.1, DHCP gives the
+#    PC .2, telnet on 23; /bin/rebootarg download returns to Download mode. v16 (2026-11-15): .42,
+#    postmarketOS's own USB network (was 172.16.43.x), so Open Android DeX finds the phone on the cable
+# The kernel has no devtmpfs and no uevent helper: device nodes come from "mdev -s", re-run often.
+
+/bin/busybox mkdir -p /bin /sbin /usr/bin /usr/sbin /proc /sys /dev /tmp /run /mnt
+/bin/busybox --install -s
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t tmpfs -o mode=0755,size=64m dev /dev
+mdev -s
+mkdir -p /dev/pts /dev/shm
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+mount -t configfs configfs /sys/kernel/config 2>/dev/null
+mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+echo 0 > /proc/sys/kernel/hung_task_timeout_secs 2>/dev/null
+
+mkdir -p /tmp/prev
+cp /sys/fs/pstore/* /tmp/prev/ 2>/dev/null
+
+up() { cut -d' ' -f1 /proc/uptime; }
+plog() {
+	[ -c /dev/pmsg0 ] && echo "$*" > /dev/pmsg0 2>/dev/null
+	echo "s24-init: $*" > /dev/kmsg 2>/dev/null
+	echo "$(up) $*" >> /tmp/init.log
+}
+plog "boot: v4 start at $(up)s, kernel $(uname -r), pmsg $([ -c /dev/pmsg0 ] && echo yes || echo no), prev pstore: $(ls /tmp/prev | tr '\n' ' ')"
+
+ML=$(find /lib/modules -maxdepth 2 -name modules.load 2>/dev/null | head -n1)
+D=$(dirname "${ML:-/lib/modules/x}")
+plog "modules.load=${ML:-none} ($(cat "$ML" 2>/dev/null | wc -l) entries, $(find /lib/modules -name '*.ko' | wc -l) .ko); first: $(head -n3 "$ML" 2>/dev/null | tr '\n' ' ')"
+kofile() { case "$1" in *.ko) echo "$D/$1";; *) echo "$D/$1.ko";; esac; }
+
+# Previous boot: skip list carried forward, plus the module it died on; probe marker.
+SKIP=""; PROBED=""
+P=$(ls /tmp/prev/pmsg-ramoops-* 2>/dev/null | head -n1)
+if [ -n "$P" ]; then
+	SKIP=$(grep -a '^skip:' "$P" | tail -n1 | cut -d: -f2-)
+	last=$(grep -a -E '^(loading|loaded):' "$P" | tail -n1)
+	case "$last" in loading:*) SKIP="$SKIP ${last#loading:}"; plog "prev boot died loading ${last#loading:}";; esac
+	grep -a -q '^probe: rebooting' "$P" && PROBED=1
+	grep -a -q '^net: up' "$P" && plog "prev boot had reached networking"
+fi
+plog "skip:$SKIP"
+
+# Probe (image with /probe only): prove this init runs by going back to Download mode.
+if [ -e /probe ]; then
+	for m in $(head -n5 "$ML" 2>/dev/null); do insmod "$(kofile "$m")" 2>>/tmp/insmod.err; done
+	plog "probe: rebooting to download at $(up)s (exynos-reboot loaded: $(grep -c '^exynos_reboot ' /proc/modules))"
+	sync
+	/bin/rebootarg download
+	sleep 3
+	/bin/rebootarg
+fi
+
+( while true; do mdev -s 2>/dev/null; sleep 2; done ) &
+
+# Watchdogs: /dev/watchdog like Android's "watchdogd 10 20", then any other watchdog device.
+(
+	while true; do
+		for w in /dev/watchdog /dev/watchdog[0-9]*; do
+			[ -c "$w" ] || continue
+			b=$(basename $w); [ -e "/tmp/fed.$b" ] && continue
+			touch "/tmp/fed.$b"
+			watchdog -T 30 -t 10 -F "$w" 2>>/tmp/watchdog.err &
+			plog "feeding $w"
+		done
+		sleep 1
+	done
+) &
+
+udc() { ls /sys/class/udc 2>/dev/null | head -n1; }
+
+net_up() {
+	G=/sys/kernel/config/usb_gadget/s24
+	[ -d $G ] && return 0
+	mkdir -p $G $G/strings/0x409 $G/functions/ncm.usb0 $G/functions/acm.GS0 $G/configs/c.1/strings/0x409
+	# v8: Linux Foundation multifunction composite ID; with Google's 18D1:D001 Windows binds its ADB
+	# driver to the whole device instead of UsbNcm + usbser
+	echo 0x1d6b > $G/idVendor
+	echo 0x0104 > $G/idProduct
+	# composite (NCM network + ACM serial shell): IAD device class so Windows splits the functions
+	echo 0xEF > $G/bDeviceClass
+	echo 0x02 > $G/bDeviceSubClass
+	echo 0x01 > $G/bDeviceProtocol
+	echo "S24-bringup" > $G/strings/0x409/serialnumber
+	echo "postmarketOS" > $G/strings/0x409/manufacturer
+	echo "Galaxy S24 bring-up" > $G/strings/0x409/product
+	echo "02:24:e1:00:00:01" > $G/functions/ncm.usb0/dev_addr 2>/dev/null
+	echo "02:24:e1:00:00:02" > $G/functions/ncm.usb0/host_addr 2>/dev/null
+	echo "NCM" > $G/configs/c.1/strings/0x409/configuration
+	ln -s $G/functions/ncm.usb0 $G/configs/c.1/ 2>/dev/null
+	ln -s $G/functions/acm.GS0 $G/configs/c.1/ 2>/dev/null
+	echo "$1" > $G/UDC
+	# serial shell on the ACM port (a COM port on Windows), respawned; "touch /tmp/stay" in it keeps
+	# the phone up (no Download-mode fallback)
+	( while true; do
+		mdev -s 2>/dev/null
+		[ -c /dev/ttyGS0 ] && setsid sh -c 'exec /bin/sh -i <>/dev/ttyGS0 >&0 2>&0'
+		sleep 1
+	done ) &
+	IF=$(cat $G/functions/ncm.usb0/ifname 2>/dev/null)
+	ip link set lo up
+	ip addr add 172.16.42.1/24 dev "$IF"
+	ip link set "$IF" up
+	printf 'start 172.16.42.2\nend 172.16.42.2\nmax_leases 1\ninterface %s\nlease_file /tmp/udhcpd.leases\noption subnet 255.255.255.0\n' "$IF" > /tmp/udhcpd.conf
+	touch /tmp/udhcpd.leases
+	/bin/busybox-extras udhcpd /tmp/udhcpd.conf
+	/bin/busybox-extras telnetd -l /bin/sh -p 23 -b 172.16.42.1  # v15: USB link only (no password)
+	plog "net: up on $1 / $IF at $(up)s"
+}
+
+# v6: the full v5 load crashed the phone ~86 s into the boot (watchdog-style reset) before USB came
+# up. Now only the core modules load at boot (clocks, power, PMICs, buses, storage, USB, Samsung's
+# debug/reboot handlers); the usual crash suspects (display, GPU, camera, NPU, codecs, audio,
+# sensors, touch/haptics, NFC/BT/Wi-Fi, modem, test modules) are written to /tmp/deferred, to be
+# loaded by hand over the USB shell while the kernel log is watched. Anything a core module needs
+# (modules.dep, transitively) stays core: dwc3-exynos-usb alone needs abox/vts/nanohub.
+# v7: v6 crashed at 88 s too, like v5 and the gzip images: the bootloader starts the hardware
+# watchdog and nothing took it over. modules.load is NOT in dependency order (s3c2410_wdt is #5 but
+# needs #37..#75; dwc3-exynos-usb #139 needs #283..), and plain insmod in list order failed on
+# unknown symbols. Android's libmodprobe loads each module's modules.dep entries first (last one
+# first); the plan now does the same, so /tmp/core and /tmp/deferred are in a loadable order.
+# v9: modules.softdep too, as libmodprobe does ("softdep MOD pre: A B post: C"). Without it the
+# display could not work: exynos_drm pre: samsung_dma_heap (else "failed to alloc cgc lut" and a
+# NULL dereference in dqe_reg_set_cgc_lut at the first modeset), mcd_panel pre: s2dos05-regulator
+# i2c-exynos5 (the panel power IC; else "panel id read failure", panel disconnected).
+plan_modules() { # $1 modules.load, $2 modules.dep, $3 modules.softdep -> /tmp/core, /tmp/deferred
+	awk -v depfile="$2" -v softfile="$3" '
+	function base(s) { gsub(/\r/, "", s); sub(/:$/, "", s); sub(/.*\//, "", s); sub(/\.ko$/, "", s); return s }
+	function norm(s) { gsub(/-/, "_", s); return s }
+	function known(s,    b) { b = norm(base(s)); return (b in byname) ? byname[b] : "" }
+	function emit(m, out,    k, dl, j) {
+		if (m in done) return
+		done[m] = 1
+		k = split(deps[m], dl, " ")
+		for (j = k; j >= 1; j--) emit(dl[j], out)
+		print m >> out
+		k = split(post[m], dl, " ")
+		for (j = 1; j <= k; j++) if (!(core_pass && (dl[j] in defer))) emit(dl[j], out)
+	}
+	BEGIN {
+		while ((getline line < depfile) > 0) {
+			n = split(line, f, /[ \t]+/); m = base(f[1]); if (m == "") continue
+			byname[norm(m)] = m
+			if (!(m in deps)) deps[m] = ""
+			for (i = 2; i <= n; i++) if (f[i] != "") { d = base(f[i]); deps[m] = deps[m] " " d; byname[norm(d)] = d }
+		}
+		while ((getline line < softfile) > 0) {
+			gsub(/\r/, "", line)
+			if (line !~ /^softdep[ \t]/) continue
+			n = split(line, f, /[ \t]+/); m = known(f[2]); if (m == "") continue
+			mode = ""
+			for (i = 3; i <= n; i++) {
+				t = f[i]
+				if (t ~ /^pre:/) { mode = "pre"; sub(/^pre:/, "", t) }
+				else if (t ~ /^post:/) { mode = "post"; sub(/^post:/, "", t) }
+				if (t == "" || mode == "") continue
+				d = known(t); if (d == "" || d == m) continue
+				if (mode == "pre") deps[m] = deps[m] " " d; else post[m] = post[m] " " d
+				softn++
+			}
+		}
+	}
+	{
+		name = base($1); if (name == "") next; order[++cnt] = name
+		if (!(norm(name) in byname)) byname[norm(name)] = name
+		# v8: display, touch, audio and sensors load in the stock order again (v7 deferred
+		# phy-exynos-mipi-dsim and the panels: the DSI host then failed for good, -17, and the
+		# panel driver called the panel disconnected); still deferred: camera, NPU, codecs,
+		# modem/GNSS, NFC, Bluetooth and test modules (v12: the cnss Wi-Fi platform modules load
+		# again; they wait for fs_ready before touching the chip)
+		if (name ~ /(^|[-_])is-|camera|votf|(^|[-_])npu|mfc|smfc|scaler|jpeg|g2d|cpif|modem|shm_ipc|mcu_ipc|gnss|gps|nfc|btpower|test/)
+			defer[name] = 1
+	}
+	END {
+		changed = 1
+		while (changed) {
+			changed = 0
+			for (i = 1; i <= cnt; i++) {
+				m = order[i]; if (m in defer) continue
+				k = split(deps[m], d, " ")
+				for (j = 1; j <= k; j++) if (d[j] in defer) { delete defer[d[j]]; changed = 1 }
+			}
+		}
+		printf "" > "/tmp/core"; printf "" > "/tmp/deferred"
+		core_pass = 1
+		for (i = 1; i <= cnt; i++) { m = order[i]; if (!(m in defer)) emit(m, "/tmp/core") }
+		core_pass = 0
+		for (i = 1; i <= cnt; i++) { m = order[i]; if (m in defer) emit(m, "/tmp/deferred") }
+		print softn + 0 > "/tmp/softdeps"
+	}' "$1"
+}
+# Module options from the kernel command line ("module.param=value"), as Android's libmodprobe does.
+cmdopts() {
+	for t in $(cat /proc/cmdline); do
+		case "$t" in "$1".*=*) echo "${t#"$1".}";; esac
+	done | tr '\n' ' '
+}
+plan_modules "$ML" "$D/modules.dep" "$D/modules.softdep"
+plog "plan: $(grep -c . /tmp/core) core, $(cat /tmp/softdeps) softdeps, $(grep -c . /tmp/deferred) deferred: $(tr '\n' ' ' < /tmp/deferred | cut -c1-600)"
+# v10: the bootloader names the panel with a bare "lcdtype=" on the command line; the mcd_panel
+# module only takes it as its (read-only) boot_panel_id parameter, so it must go in at load time
+# (without it: "find_panel_lut ... id:0x00000000", default LUT, lcd_type SDC_000000).
+LCDTYPE=""
+for t in $(cat /proc/cmdline); do case "$t" in lcdtype=*) LCDTYPE="${t#lcdtype=}";; esac; done
+plog "lcdtype=${LCDTYPE:-none}"
+n=0; ok=0
+for m in $(cat /tmp/core); do
+	case " $SKIP " in *" $m "*) plog "skipping $m"; continue;; esac
+	name=$(echo "$m" | tr - _)
+	grep -q -s "^blocklist $name\$" "$D/modules.blocklist" && continue
+	opts="$(grep -s "^options $name " "$D/modules.options" | cut -d' ' -f3-) $(cmdopts "$name")"
+	[ "$name" = mcd_panel ] && [ -n "$LCDTYPE" ] && opts="$opts boot_panel_id=$LCDTYPE"
+	plog "loading:$m"
+	insmod "$(kofile "$m")" $opts 2>>/tmp/insmod.err && ok=$((ok + 1))
+	plog "loaded:$m"
+	n=$((n + 1))
+	if [ -n "$(udc)" ] && [ ! -d /sys/kernel/config/usb_gadget/s24 ]; then plog "udc after $n modules: $(udc)"; net_up "$(udc)"; fi
+done
+plog "modules: $ok of $n loaded; done at $(up)s"
+i=0
+while [ -z "$(udc)" ] && [ $i -lt 20 ]; do sleep 1; i=$((i + 1)); done
+[ -n "$(udc)" ] && [ ! -d /sys/kernel/config/usb_gadget/s24 ] && net_up "$(udc)"
+[ -z "$(udc)" ] && plog "net: no udc after all modules"
+
+# v15: USB charging. Samsung's battery driver caps a computer's USB port at 100 mA
+# (VOTER_USB_100MA) until its USB stack reports the gadget configured, which Android's does and
+# plain configfs does not: report it whenever the host configures the gadget, 850 mA on
+# SuperSpeed, 475 mA otherwise (Samsung's USB_CURRENT_SUPER_SPEED / _HIGH_SPEED). Chargers that are
+# not computers (DCP, PD) are handled by the driver itself.
+(
+	last=""
+	while true; do
+		st=$(cat /sys/class/udc/*/state 2>/dev/null | head -n1)
+		if [ "$st" = configured ] && [ "$last" != configured ]; then
+			sp=$(cat /sys/class/udc/*/current_speed 2>/dev/null | head -n1)
+			case "$sp" in super*) ma=850;; *) ma=475;; esac
+			echo "$ma" > /sys/class/power_supply/battery/usb_conf_test 2>/dev/null &&
+				plog "usb charging: host configured the gadget ($sp), $ma mA"
+		fi
+		last=$st
+		sleep 2
+	done
+) &
+
+# v11: boot the Linux root on userdata (ext4, postmarketOS) automatically: after a 10 s grace
+# period PID 1 is handed to it by the loop below ("touch /tmp/stay-stage0" over telnet or the serial
+# shell keeps the phone in stage 0). Without a Linux root the phone stays in stage 0. The v5-v10
+# Download-mode fallback is gone: it would reboot a phone that is simply not plugged into a PC.
+mdev -s 2>/dev/null
+UD=""
+for d in /sys/class/block/sd*; do
+	grep -q "^PARTNAME=userdata$" "$d/uevent" 2>/dev/null && UD=/dev/$(basename "$d")
+done
+mkdir -p /newroot
+if [ -n "$UD" ] && mount -t ext4 -o rw,noatime "$UD" /newroot 2>>/tmp/mount.err; then
+	if [ -e /newroot/sbin/init ] || [ -L /newroot/sbin/init ]; then
+		# v12: Wi-Fi as Android's init.insmod.sh wifi + post-fs-data do it. The firmware lives in
+		# the Linux root at /vendor/firmware (from the stock vendor partition) and is bound to
+		# /vendor here, because the kernel loads firmware relative to this ramdisk's root
+		# (firmware_class.path=/vendor/firmware); the dlkm modules are in /lib/modules/*_dlkm.
+		if [ -d /newroot/vendor/firmware ]; then
+			mkdir -p /vendor
+			mount -o bind /newroot/vendor /vendor
+			for k in system_dlkm/rfkill vendor_dlkm/cfg80211 vendor_dlkm/kiwi_v2; do
+				[ -f "/newroot/lib/modules/$k.ko" ] && insmod "/newroot/lib/modules/$k.ko" 2>>/tmp/insmod.err
+			done
+			for f in /sys/devices/platform/qcom,cnss-*/fs_ready; do [ -e "$f" ] && echo 1 > "$f"; done
+			plog "wifi: firmware bound, $(grep -c -E "^(cfg80211|kiwi_v2) " /proc/modules) of 2 wlan modules in, fs_ready set"
+		fi
+		plog "linux root on $UD; switching in 10 s unless /tmp/stay-stage0 exists"
+		(
+			sleep 10
+			if [ -e /tmp/stay-stage0 ]; then
+				plog "stay-stage0 set: not switching"
+			else
+				echo /newroot > /tmp/switchroot
+			fi
+		) &
+	else
+		plog "userdata $UD has no /sbin/init; staying in stage 0"
+		umount /newroot
+	fi
+else
+	plog "no ext4 Linux root on userdata (${UD:-not found}); staying in stage 0"
+fi
+
+# PID 1 must never exit. v8: "echo /newroot > /tmp/switchroot" (a mounted Linux root with
+# /sbin/init) hands PID 1 over to it with chroot, not switch_root: this ramdisk stays intact, so
+# telnetd, the serial shell, the mdev loop and the watchdog feeders keep running underneath, and
+# /dev (kept up to date by the mdev loop), /proc and /sys are shared with the new root.
+while true; do
+	if [ -s /tmp/switchroot ]; then
+		R=$(cat /tmp/switchroot)
+		rm -f /tmp/switchroot
+		if [ -x "$R/sbin/init" ] || [ -L "$R/sbin/init" ]; then
+			plog "switch: handing PID 1 to $R/sbin/init at $(up)s"
+			for m in dev proc sys; do mkdir -p "$R/$m"; mount -o rbind "/$m" "$R/$m"; done
+			cd "$R" && exec chroot . /sbin/init
+			plog "switch: exec failed"
+		else
+			plog "switch: $R has no /sbin/init"
+		fi
+	fi
+	sleep 1
+done

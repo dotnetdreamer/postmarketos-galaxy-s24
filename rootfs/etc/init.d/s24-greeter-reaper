@@ -1,0 +1,11 @@
+#!/sbin/openrc-run
+# /etc/init.d/s24-greeter-reaper (Claude, 2026-11-15)
+description="Ends the processes phrog's greeter leaves running after each login"
+command=/usr/local/sbin/s24-greeter-reaper
+command_background=yes
+pidfile=/run/s24-greeter-reaper.pid
+
+depend() {
+	need dbus
+	after greetd
+}

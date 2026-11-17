@@ -1,0 +1,31 @@
+#!/bin/sh
+# Galaxy S24 sound for postmarketOS, run by OpenRC's "local" service at boot (Claude, 2026-11-15).
+# Sets the stock speaker and main-microphone routes on the ABOX sound card, the way Samsung's audio
+# HAL does on Android (mixer_paths.xml defaults + "media-speaker" + "gain-media-speaker", and
+# "recording-mic"). Routes only connect things: amplifiers and microphones power up while a
+# stream runs and down again after. PulseAudio uses them through default.pa.d/s24-sound.pa.
+S=/usr/local/share/s24
+LOG=/var/log/s24-audio.log
+(
+	# the card's DSP controls appear once its topology is loaded
+	i=0
+	while [ $i -lt 90 ] && ! amixer -c0 cget name='ABOX VDSP3' >/dev/null 2>&1; do
+		sleep 1
+		i=$((i + 1))
+	done
+	echo "$(date) card ready after ${i}s" > $LOG
+	cat $S/s24-speaker.amixer $S/s24-mic.amixer | amixer -c0 -q -s >> $LOG 2>&1
+	echo "$(date) routes set (exit $?)" >> $LOG
+	# PulseAudio's ALSA library carries the whole-period fix this DSP needs (s24-sound.pa); a
+	# reinstall of the same pulseaudio-alsa puts the stock one back, a new version needs a rebuild
+	lib=/usr/lib/pulseaudio/modules/libalsa-util.so
+	if [ -f $S/libalsa-util.so ] && ! cmp -s $S/libalsa-util.so $lib; then
+		ver=$(apk info -e -v pulseaudio-alsa 2>/dev/null | sed 's/^pulseaudio-alsa-//')
+		if [ "$ver" = "$(cat $S/libalsa-util.version 2>/dev/null)" ]; then
+			cp $S/libalsa-util.so $lib && echo "$(date) patched libalsa-util.so restored" >> $LOG
+		else
+			echo "$(date) WARNING: pulseaudio-alsa is now $ver: speaker sound will stutter until libalsa-util.so is rebuilt with pa-whole-periods.patch" >> $LOG
+		fi
+	fi
+) &
+exit 0

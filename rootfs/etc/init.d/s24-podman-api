@@ -1,0 +1,27 @@
+#!/sbin/openrc-run
+# /etc/init.d/s24-podman-api (Claude, 2026-11-15)
+# Podman's API as root, its socket shared with one group. The Galaxy S24's kernel has no user
+# namespaces, so podman can't run rootless; desktop apps (Podman Desktop) and the user's podman
+# command (CONTAINER_HOST, /etc/profile.d/s24-podman.sh) use this socket instead. As with Docker's
+# docker group, belonging to that group is as good as root.
+supervisor=supervise-daemon
+name="Podman API (root, shared with group ${podman_api_group:=user})"
+command=/usr/bin/podman
+command_args="system service --time 0 unix:///run/podman/podman.sock"
+
+depend() {
+	need sysfs cgroups
+}
+
+start_pre() {
+	checkpath -d -m 0750 -o "root:${podman_api_group}" /run/podman
+}
+
+start_post() {
+	i=0
+	while [ ! -S /run/podman/podman.sock ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+	chgrp "${podman_api_group}" /run/podman/podman.sock && chmod 0660 /run/podman/podman.sock
+	ebegin "Starting containers set to restart always or unless-stopped"
+	/usr/bin/podman start --all --filter restart-policy=always --filter restart-policy=unless-stopped >/dev/null 2>&1
+	eend 0
+}

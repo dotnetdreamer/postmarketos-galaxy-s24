@@ -1,0 +1,191 @@
+#!/bin/sh
+# /usr/local/bin/s24-fit (Galaxy S24, postmarketOS; Claude, 2026-11-16): makes desktop apps fit the
+# phone screen. Many have a width their window never goes below (measured: Chromium and Brave 500 px,
+# VS Code 432, Podman Desktop 672, GNOME System Monitor 620), but the phone screen is 393 px wide
+# (1080 pixels at scale 2.75), so on the phone their right edge, menus included, ends up off the
+# screen. While the phone screen is the only screen and is narrower than that, they're drawn smaller:
+#   s24-fit flag MINWIDTH        prints --force-device-scale-factor=F, or nothing when the app fits
+#   s24-fit factor MINWIDTH      prints F alone
+#   s24-fit run MINWIDTH CMD...  runs CMD drawn at F on a compositor of its own, in a window on this
+#                                screen; just runs CMD when it fits
+# F = (screen width - 2) / MINWIDTH in whole 0.05 steps (0.75 for 500 px; a factor Chromium's
+# rounding can't push a pixel past the edge), never under 0.5: below that text gets unreadable,
+# and turning the phone sideways (851 px) fits such an app at full size anyway. A wider screen
+# (landscape, mouse mode, a computer's screen through the postmarketOS desktop) gets nothing, and
+# F stays what it was at launch.
+# flag: Chromium and Electron apps; on Wayland Chromium multiplies the screen's own scale by F.
+# run: any Wayland app (GTK has no switch like that). A nested kwin_wayland whose one output is a
+# window here, with /usr/local/lib/libs24fit.so preloaded: that makes the output 1/F times wider in
+# logical px at F times this screen's scale, the same pixels (full sharpness), and maps the window and
+# touches back (see libs24fit.c). The window gets the app's title and app id, so the task switcher and
+# the app drawer know it: S24_FIT_APP_ID=<.desktop file name without .desktop>, its Name= the title
+# (or S24_FIT_TITLE). The KWin runs on a private D-Bus (its org.kde.KWin must not meet the real one)
+# with copies of the user's settings (it writes its own) and starts its own on-screen keyboard, which
+# shows inside its window (the phone's can't reach in). The app keeps the real session bus, only its
+# display is the nested one, and X11 is cut off so nothing bypasses it; the KWin leaves with the app,
+# so this is for apps that stay in the foreground (no launcher that forks and exits).
+# S24_FIT="F WIDTH HEIGHT SCALE" skips the measurement (tests; or a size of your own choosing),
+# S24_FIT_DEBUG=1 prints what run does.
+# Launchers call this before they point the environment at the glibc libraries: kscreen-doctor and
+# python3 are musl programs.
+usage() {
+	echo "usage: s24-fit flag|factor MINWIDTH | s24-fit run MINWIDTH COMMAND [ARG...]" >&2
+	exit 2
+}
+mode=$1
+need=$2
+case "$mode" in
+flag | factor) [ $# -eq 2 ] || usage ;;
+run) [ $# -ge 3 ] || usage ;;
+*) usage ;;
+esac
+shift 2
+
+# "F WIDTH HEIGHT SCALE" (logical px, as the screen is turned) when the only screen is narrower than $need.
+# Asks KWin itself first (KSCREEN_BACKEND_INPROCESS: no service to start), then the KScreen service:
+# right after a boot, starting that service can take longer than the timeout (2026-11-16: a Brave
+# opened minutes after a reboot came up unscaled; the same question took 0.17 s once the boot was done).
+narrow() {
+	[ -n "$need" ] && [ -n "$WAYLAND_DISPLAY" ] || return 0
+	j=$(KSCREEN_BACKEND=KWayland KSCREEN_BACKEND_INPROCESS=1 timeout 3 kscreen-doctor -j 2>/dev/null)
+	case "$j" in
+	*'"outputs"'*) ;;
+	*) j=$(timeout 6 kscreen-doctor -j 2>/dev/null) ;;
+	esac
+	printf '%s\n' "$j" | python3 -c '
+import json, sys
+need = float(sys.argv[1])
+try:
+    outs = [o for o in json.load(sys.stdin)["outputs"] if o.get("enabled")]
+except Exception:
+    sys.exit()
+if len(outs) != 1:
+    sys.exit()
+o = outs[0]
+s = o.get("scale") or 1
+w, h = o["size"]["width"], o["size"]["height"]
+if o.get("rotation") in (2, 8):
+    w, h = h, w
+room = w / s - 2
+if room < need:
+    print(max(int(room / need * 20) / 20, 0.5), w / s, h / s, s)
+' "$need" 2>/dev/null
+}
+
+r=${S24_FIT:-$(narrow)}
+read -r f w h s <<EOF
+$r
+EOF
+case "$mode" in
+flag) [ -n "$f" ] && echo "--force-device-scale-factor=$f" ;;
+factor) [ -n "$f" ] && echo "$f" ;;
+esac
+[ "$mode" = run ] || exit 0
+lib=/usr/local/lib/libs24fit.so
+[ -n "$f" ] && [ -n "$s" ] && [ -r "$lib" ] || exec "$@"
+
+id=$S24_FIT_APP_ID
+t=$S24_FIT_TITLE
+if [ -z "$t" ] && [ -n "$id" ]; then
+	for df in "$HOME/.local/share/applications" /usr/local/share/applications /usr/share/applications; do
+		[ -f "$df/$id.desktop" ] && t=$(sed -n 's/^Name=//p' "$df/$id.desktop" | head -n 1) && break
+	done
+fi
+[ -n "$t" ] || t=${1##*/}
+
+d=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/s24-fit.XXXXXX") || exec "$@"
+sock=${d##*/}-wayland
+kw= bus= app=
+cleanup() {
+	[ -n "$app" ] && kill "$app" 2>/dev/null
+	if [ -n "$kw" ]; then
+		# its keyboard can hang on the way out, and the KWin waits for it: 2 s, then KILL
+		pkill -TERM -P "$kw" 2>/dev/null
+		kill "$kw" 2>/dev/null
+		i=0
+		while [ $i -lt 20 ] && [ -d "/proc/$kw" ] && ! grep -q '^[0-9]* (.*) Z' "/proc/$kw/stat" 2>/dev/null; do
+			sleep 0.1
+			i=$((i + 1))
+		done
+		pkill -KILL -P "$kw" 2>/dev/null
+		kill -KILL "$kw" 2>/dev/null
+		wait "$kw" 2>/dev/null
+	fi
+	[ -n "$bus" ] && kill "$bus" 2>/dev/null
+	[ -n "$S24_FIT_DEBUG" ] && sed 's/^/s24-fit: kwin: /' "$d/kwin.log" >&2
+	rm -rf "$d"
+	rm -f "${XDG_RUNTIME_DIR:-/tmp}/$sock" "${XDG_RUNTIME_DIR:-/tmp}/$sock.lock" # a killed KWin leaves them
+}
+trap cleanup EXIT
+trap 'exit 143' INT TERM HUP
+# a close request from this screen (swiping it away in the task switcher), passed on by libs24fit.so:
+# the nested KWin closes the app's windows, as the app's own close button would
+closes=0
+close_app() {
+	closes=$((closes + 1)) # a script name KWin hasn't loaded yet
+	printf '%s\n' 'for (const w of workspace.windowList()) if (w.normalWindow) w.closeWindow();' \
+		>"$d/close$closes.js"
+	r=$(DBUS_SESSION_BUS_ADDRESS="$addr" dbus-send --session --print-reply --dest=org.kde.KWin /Scripting \
+		org.kde.kwin.Scripting.loadScript string:"$d/close$closes.js" 2>&1)
+	sid=$(echo "$r" | awk '/int32/ { print $2 }')
+	[ -n "$sid" ] && [ "$sid" -ge 0 ] && r=$(DBUS_SESSION_BUS_ADDRESS="$addr" dbus-send --session --print-reply \
+		--dest=org.kde.KWin "/Scripting/Script$sid" org.kde.kwin.Script.run 2>&1)
+	[ -n "$S24_FIT_DEBUG" ] && echo "s24-fit: close request $closes, script id '$sid', run: $r" >&2
+}
+trap close_app USR1
+mkdir "$d/config"
+for c in "${XDG_CONFIG_HOME:-$HOME/.config}"/*rc; do
+	[ -f "$c" ] && cp "$c" "$d/config/"
+done
+cat >"$d/bus.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig><type>session</type><listen>unix:dir=$d</listen>
+<policy context="default"><allow send_destination="*" eavesdrop="true"/><allow eavesdrop="true"/><allow own="*"/></policy>
+</busconfig>
+EOF
+dbus-daemon --config-file="$d/bus.conf" --nofork --print-address >"$d/address" 2>/dev/null &
+bus=$!
+i=0
+while [ ! -s "$d/address" ] && [ $i -lt 50 ]; do
+	sleep 0.1
+	i=$((i + 1))
+done
+addr=$(head -n 1 "$d/address")
+[ -n "$addr" ] || exit 1
+# its window's size and scale as the nested KWin sees them (libs24fit.so keeps them so)
+nw=$(awk -v w="$w" -v f="$f" 'BEGIN { printf "%d", w / f + 0.5 }')
+nh=$(awk -v h="$h" -v f="$f" 'BEGIN { printf "%d", h / f + 0.5 }')
+ns=$(awk -v s="$s" -v f="$f" 'BEGIN { printf "%.4f", s * f }')
+env -u DISPLAY DBUS_SESSION_BUS_ADDRESS="$addr" XDG_CONFIG_HOME="$d/config" \
+	LD_PRELOAD="$lib${LD_PRELOAD:+ $LD_PRELOAD}" S24_FIT_PRELOAD="$LD_PRELOAD" S24_FIT_F="$f" \
+	S24_FIT_TITLE="$t" S24_FIT_APP_ID="$id" S24_FIT_NOTIFY=$$ \
+	kwin_wayland --wayland-display "$WAYLAND_DISPLAY" --socket "$sock" --width "$nw" --height "$nh" \
+	--scale "$ns" --no-lockscreen --no-global-shortcuts --no-kactivities >/dev/null 2>"$d/kwin.log" &
+kw=$!
+i=0
+while [ ! -S "${XDG_RUNTIME_DIR:-/tmp}/$sock" ] && [ $i -lt 100 ]; do
+	kill -0 "$kw" 2>/dev/null || exit 1
+	sleep 0.1
+	i=$((i + 1))
+done
+if [ -n "$S24_FIT_DEBUG" ]; then
+	echo "s24-fit: F $f screen ${w}x$h at $s, nested ${nw}x$nh at $ns, '$t' ($id), socket $sock" >&2
+	(
+		sleep 3
+		DBUS_SESSION_BUS_ADDRESS="$addr" dbus-send --session --print-reply --dest=org.kde.KWin /KWin \
+			org.kde.KWin.supportInformation 2>/dev/null | grep -E '^ *(Name|Geometry|Scale):' |
+			sed 's/^ */s24-fit: nested output: /' >&2
+	) &
+fi
+env -u DISPLAY -u S24_FIT_APP_ID -u S24_FIT_TITLE WAYLAND_DISPLAY="$sock" GDK_BACKEND=wayland \
+	QT_QPA_PLATFORM=wayland "$@" &
+app=$!
+# wait returns early for a trapped signal (USR1 above): wait again while the app still runs
+while :; do
+	wait "$app"
+	rc=$?
+	kill -0 "$app" 2>/dev/null || break
+done
+app=
+exit $rc

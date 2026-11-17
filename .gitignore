@@ -1,0 +1,14 @@
+# build output
+stage0/out/
+*.o
+*.ko
+*.so
+*.img
+*.tar
+*.cpio*
+__pycache__/
+# never commit device data: partition dumps, EFS, Bluetooth address, logs with identifiers
+*.bin
+backup/
+logs/
+bt_addr

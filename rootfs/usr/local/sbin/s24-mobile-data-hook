@@ -1,0 +1,135 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): what happens around a mobile data call.
+#   s24-mobile-data-hook up IFACE DNS...   (s24-mmd or s24-radio, once the call is up)
+#   s24-mobile-data-hook clat              (NetworkManager's dispatcher, once IFACE has its address)
+#   s24-mobile-data-hook down IFACE        (once the call is gone)
+#   s24-mobile-data-hook refresh           (NetworkManager's dispatcher, after Wi-Fi/DNS changes)
+# DNS: the mobile DNS is kept out of NetworkManager (musl asks every nameserver at once, so mobile
+# DNS64 answers would mix with Wi-Fi's): while NetworkManager has no DNS of its own (no Wi-Fi),
+# /etc/resolv.conf gets the mobile DNS servers; once Wi-Fi is back NetworkManager writes its own.
+# Routes: NetworkManager puts mobile data routes in table 1430 (Nura's 50-wwan-policy.conf) and
+# nothing looks there; a rule after the main table makes it the fallback when Wi-Fi is gone.
+# IPv4: an IPv6-only network (some carriers) reaches IPv4 names through its DNS64/NAT64; clatd + TAYGA
+# (464XLAT, as Android's clatd) also give programs a plain IPv4 route. Its route has metric 2048,
+# so Wi-Fi's IPv4 (600) wins whenever Wi-Fi is up and nothing has to restart.
+RUN=/run/s24-mobile-data
+RC=/etc/resolv.conf
+MARK='# s24-mobile-data'
+LOG=/var/log/s24-clatd.log
+
+refresh_dns() {
+	if [ -s $RUN/dns ]; then
+		if ! grep -q '^nameserver' $RC 2>/dev/null || head -n1 $RC 2>/dev/null | grep -q "^$MARK"; then
+			{ echo "$MARK: no Wi-Fi, mobile data's DNS"; sed 's/^/nameserver /' $RUN/dns; } > $RC.s24 &&
+				mv $RC.s24 $RC
+		fi
+	elif head -n1 $RC 2>/dev/null | grep -q "^$MARK"; then
+		echo "$MARK: mobile data is off" > $RC.s24 && mv $RC.s24 $RC
+	fi
+}
+
+# the NAT64 prefix (RFC 7050: ask the mobile DNS for ipv4only.arpa), pinned to the mobile link
+plat_prefix() {
+	d=$(head -n1 $RUN/dns) iface=$1 added=1
+	ip -6 route add "$d/128" dev "$iface" 2>/dev/null && added=0
+	a=$(nslookup -type=AAAA ipv4only.arpa "$d" 2>/dev/null | sed -n '/^Name:/,$p' |
+		awk '/Address/ {print $NF; exit}')
+	[ $added = 0 ] && ip -6 route del "$d/128" dev "$iface" 2>/dev/null
+	case "$a" in
+	*::c000:aa | *::c000:ab) echo "${a%::c000:a?}::/96" ;;
+	*) echo 64:ff9b::/96 ;;
+	esac
+}
+
+# what a killed clatd leaves behind: its TAYGA (holding the "clat" tun, so the next clatd fails
+# with "Resource busy"), the device, and its policy rule + route table (0xc1a7 = 49575)
+clat_leftovers() {
+	pkill -x tayga 2>/dev/null   # only clatd runs TAYGA on this phone
+	ip link del clat 2>/dev/null
+	while ip -6 rule del prio 0 table 49575 2>/dev/null; do :; done
+	ip -6 route flush table 49575 2>/dev/null
+}
+
+stop_clat() {
+	if [ -f $RUN/clatd.pid ]; then
+		pid=$(cat $RUN/clatd.pid)
+		# clatd ignores TERM while TAYGA runs: it expects the whole group to be signalled (as
+		# systemd does), then cleans up once TAYGA has exited. start-stop-daemon --background
+		# made it a group leader.
+		kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+		i=0
+		while kill -0 "$pid" 2>/dev/null && [ $i -lt 20 ]; do
+			sleep 0.5
+			i=$((i + 1))
+		done
+		kill -KILL -- "-$pid" 2>/dev/null
+		rm -f $RUN/clatd.pid
+	fi
+	clat_leftovers
+	if [ -s $RUN/plat ]; then
+		ip -6 route del $(cat $RUN/plat) 2>/dev/null
+		rm -f $RUN/plat
+	fi
+}
+
+# clatd's own address in the mobile /64 (the network routes the whole /64 to the phone). Its default,
+# "shared", reuses the phone's address facing the NAT64 (Wi-Fi's, while Wi-Fi is up) and then needs
+# nftables connection marks, which fail on this kernel ("cache initialization failed").
+clat_v6_addr() {
+	a=$(ip -6 -o addr show dev "$1" scope global 2>/dev/null | awk '{print $4; exit}')
+	[ -n "$a" ] && python3 -c 'import ipaddress, sys
+n = ipaddress.ip_interface(sys.argv[1]).network
+print(n.network_address + 0xc1a7 if n.prefixlen <= 64 else "")' "$a"
+}
+
+start_clat() {
+	iface=$1
+	stop_clat
+	command -v clatd >/dev/null || return 0
+	# only an IPv6-only call needs it
+	ip -4 addr show dev "$iface" 2>/dev/null | grep -q 'inet ' && return 0
+	clat6=$(clat_v6_addr "$iface")
+	[ -n "$clat6" ] || { echo "$(date '+%F %T') no /64 on $iface: no clatd" >> $LOG; return 0; }
+	prefix=$(plat_prefix "$iface")
+	# translated packets leave through the mobile link even while Wi-Fi is up (no NAT64 there)
+	ip -6 route replace "$prefix" dev "$iface" metric 900 && echo "$prefix dev $iface metric 900" > $RUN/plat
+	echo "$(date '+%F %T') clatd on $iface, NAT64 prefix $prefix" >> $LOG
+	start-stop-daemon --start --background --make-pidfile --pidfile $RUN/clatd.pid \
+		--stdout $LOG --stderr $LOG --exec /usr/bin/clatd -- \
+		plat-dev="$iface" plat-prefix="$prefix" clat-dev=clat clat-v6-addr="$clat6" \
+		proxynd-enable=0 v4-conncheck-enable=0 v4-defaultroute-metric=2048
+}
+
+ensure_rules() {
+	ip rule show 2>/dev/null | grep -q 'lookup 1430' || ip rule add priority 32800 table 1430
+	ip -6 rule show 2>/dev/null | grep -q 'lookup 1430' || ip -6 rule add priority 32800 table 1430
+}
+
+case "$1" in
+up)
+	mkdir -p $RUN
+	echo "$2" > $RUN/iface
+	shift 2
+	printf '%s\n' "$@" | grep . > $RUN/dns
+	ensure_rules
+	refresh_dns
+	# s24-radio has already put the address on (s24-mmd: NetworkManager does it next, then "clat")
+	start_clat "$(cat $RUN/iface)"
+	;;
+clat)
+	[ -s $RUN/iface ] && start_clat "$(cat $RUN/iface)"
+	;;
+down)
+	stop_clat
+	rm -f $RUN/iface $RUN/dns
+	refresh_dns
+	;;
+refresh)
+	refresh_dns
+	;;
+*)
+	echo "usage: $0 up IFACE DNS... | clat | down IFACE | refresh" >&2
+	exit 1
+	;;
+esac
+exit 0

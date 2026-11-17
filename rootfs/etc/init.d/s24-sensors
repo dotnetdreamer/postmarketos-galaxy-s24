@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): boots Samsung's sensor hub and serves its screen
+# orientation, ambient light and proximity sensors on net.hadess.SensorProxy (in place of
+# iio-sensor-proxy, which can't read this hub). Program: /usr/local/sbin/s24-sensord
+description="Galaxy S24 sensors: orientation, light, proximity"
+supervisor=supervise-daemon
+command=/usr/local/sbin/s24-sensord
+output_log=/var/log/s24-sensord.log
+error_log=/var/log/s24-sensord.log
+respawn_delay=2
+respawn_max=5
+
+depend() {
+	need dbus
+}
+
+start_pre() {
+	f=/var/log/s24-sensord.log
+	[ -f $f ] && [ "$(wc -c < $f)" -gt 1000000 ] && : > $f
+	# boot the hub, as Android's init.sensorhub.rc does ("write .../fs_ready 1"); the kernel loads
+	# /vendor/firmware/os.checked.bin through the stage-0 ramdisk's /vendor
+	if ! cat /sys/class/sensors/ssp_sensor/sensor_spec > /dev/null 2>&1; then
+		echo 1 > /sys/class/sensors/ssp_sensor/fs_ready
+	fi
+	return 0
+}

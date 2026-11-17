@@ -1,0 +1,18 @@
+# Reference: <https://postmarketos.org/deviceinfo>
+# Galaxy S24 (Exynos) bring-up, local only (Claude, 2026-11-14). The phone boots Samsung stock
+# kernel (BOOT) + stock VENDOR_BOOT + an own init_boot ramdisk, which loads the vendor modules,
+# prepares /dev with mdev (the kernel has no devtmpfs) and switch_roots into this rootfs on userdata.
+deviceinfo_format_version="0"
+deviceinfo_name="Samsung Galaxy S24 (Exynos)"
+deviceinfo_manufacturer="Samsung"
+deviceinfo_codename="samsung-e1s"
+deviceinfo_year="2024"
+deviceinfo_arch="aarch64"
+deviceinfo_chassis="handset"
+deviceinfo_external_storage="false"
+deviceinfo_screen_width="1080"
+deviceinfo_screen_height="2340"
+deviceinfo_flash_method="none"
+deviceinfo_generate_bootimg="false"
+deviceinfo_rootfs_image_sector_size="4096"
+deviceinfo_drm="true"

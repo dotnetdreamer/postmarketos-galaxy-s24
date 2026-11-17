@@ -1,0 +1,20 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): the s24-mmd service's supervised program. Starts
+# the Android modem container if it isn't running (from the boot shell's root: see android-ctr0.sh;
+# reached through the root of a process living there, stage-0's USB telnetd/udhcpd), then becomes
+# s24-mmd, which waits for rild itself. ModemManager can't drive this modem and would hold the D-Bus
+# name s24-mmd needs: it goes first.
+boot_root() {
+	for p in /proc/[0-9]*; do
+		[ -d "$p/root/newroot/usr/local/sbin" ] && { echo "$p/root"; return 0; }
+	done
+	return 1
+}
+
+pkill -x ModemManager 2>/dev/null
+if ! pgrep -f 'init second_stage' >/dev/null; then
+	r=$(boot_root) || { echo "s24-mmd: the boot shell's root was not found"; exit 1; }
+	echo "s24-mmd: starting the Android modem container"
+	chroot "$r" sh /newroot/usr/local/sbin/android-ctr0.sh start radio || exit 1
+fi
+exec /usr/local/sbin/s24-mmd

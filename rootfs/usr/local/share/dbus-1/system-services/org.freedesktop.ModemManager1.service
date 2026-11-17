@@ -1,0 +1,8 @@
+# Galaxy S24 (Claude, 2026-11-15): on this phone org.freedesktop.ModemManager1 is s24-mmd, started
+# by OpenRC (service s24-mmd) and nothing else: an on-demand start by D-Bus raced a restart into
+# two copies, and ModemManager itself can't drive this modem. This file comes before
+# /usr/share/dbus-1/system-services; clients wait for the name instead.
+[D-BUS Service]
+Name=org.freedesktop.ModemManager1
+Exec=/bin/false
+User=root

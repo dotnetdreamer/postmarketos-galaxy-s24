@@ -1,0 +1,24 @@
+#!/bin/sh
+# /usr/local/bin/podman-desktop (Claude, 2026-11-15): Podman Desktop's official linux-arm64 build
+# (/opt/podman-desktop), run natively on the same glibc runtime and GPU stack as VS Code (see
+# /usr/local/bin/code for why each variable and switch). This kernel has no user namespaces, so
+# podman can't run rootless: the app talks to the root API service s24-podman-api through
+# /run/podman/podman.sock (CONTAINER_HOST for the podman command it runs, and a link where it looks
+# for a rootless socket). No Chromium sandbox either (it needs PID namespaces): --no-sandbox.
+# s24-fit flag 672 (2026-11-16): the window never goes below 672 px; on the 393 px phone screen it
+# draws itself smaller (0.55) so it fits; sideways (851 px) it needs nothing. See
+# /usr/local/bin/s24-fit. It runs first: musl programs, which the glibc variables below would break.
+fit=$(/usr/local/bin/s24-fit flag 672)
+G=/var/lib/flatpak/runtime/org.freedesktop.Platform.GL.default/aarch64/25.08/active/files
+unset LD_PRELOAD
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export LIBGL_DRIVERS_PATH=$G/lib/dri GBM_BACKENDS_PATH=$G/lib/gbm
+export __EGL_VENDOR_LIBRARY_FILENAMES=$G/share/glvnd/egl_vendor.d/50_mesa.json
+export VK_DRIVER_FILES=/opt/xclipse-glibc/xclipse_icd.json VK_ICD_FILENAMES=/opt/xclipse-glibc/xclipse_icd.json
+export CONTAINER_HOST=unix:///run/podman/podman.sock
+if [ -n "$XDG_RUNTIME_DIR" ] && [ -S /run/podman/podman.sock ]; then
+	mkdir -p "$XDG_RUNTIME_DIR/podman"
+	ln -sf /run/podman/podman.sock "$XDG_RUNTIME_DIR/podman/podman.sock"
+fi
+exec /opt/podman-desktop/podman-desktop --no-sandbox --ozone-platform=wayland --enable-wayland-ime \
+	--wayland-text-input-version=3 --disable-gpu-rasterization --disable-accelerated-2d-canvas $fit "$@"

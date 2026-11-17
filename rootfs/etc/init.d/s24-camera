@@ -1,0 +1,25 @@
+#!/sbin/openrc-run
+# Galaxy S24 postmarketOS (Claude, 2026-11-17): the phone's back and front cameras for apps.
+# Samsung's camera HAL runs in the Android container (the s24-mmd service starts it);
+# /usr/local/sbin/s24-camera-run sets it up and becomes s24-cam, which shows the cameras as
+# PipeWire "Back Camera" and "Front Camera" (GNOME Snapshot and other apps). A camera only runs,
+# and only keeps the phone awake, while an app is using it. Log: /var/log/s24-camera.log
+
+description="Galaxy S24 cameras (back and front) for apps"
+
+supervisor=supervise-daemon
+command=/usr/local/sbin/s24-camera-run
+output_log=/var/log/s24-camera.log
+error_log=/var/log/s24-camera.log
+respawn_delay=10
+respawn_max=0
+
+depend() {
+	after s24-mmd
+}
+
+start_pre() {
+	f=/var/log/s24-camera.log
+	[ -f $f ] && [ "$(wc -c < $f)" -gt 2000000 ] && : > $f
+	return 0
+}

@@ -1,0 +1,3 @@
+# Galaxy S24 (Claude, 2026-11-15): PulseAudio's udev detection would probe the ABOX card's raw DMA
+# PCMs, which play nothing on their own; /etc/pulse/default.pa.d/s24-speaker.pa loads the speaker.
+SUBSYSTEM=="sound", KERNEL=="card*", ATTR{id}=="ExynosSound", ENV{PULSE_IGNORE}="1"

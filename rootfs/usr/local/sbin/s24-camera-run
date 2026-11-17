@@ -1,0 +1,116 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-17): the s24-camera service's supervised program.
+# Sets up Samsung's camera stack in the Android container, then becomes `s24-cam serve`, which
+# shows the phone's cameras to apps as PipeWire "Back Camera" and "Front Camera" (GNOME Snapshot
+# and others). A camera only runs while an app uses it. When s24-cam exits (the camera provider
+# died, a camera stalled, PipeWire went away) supervise-daemon runs all of this again.
+#   1. waits for the Android container (the s24-mmd service starts it)
+#   2. loads the camera sensor modules, which only the boot shell's ramdisk has
+#   3. starts Samsung's thermal and HyPer services (the HAL half-initialises without them)
+#   4. binds the patched HAL (SIGPIPE ignored, watchdog/DOF/destroy fixes) over the stock one
+#   5. starts s24-camd, the sensor service the HAL needs (a still gyroscope + accelerometer)
+#   6. primes the provider with cameraserver (only that builds the full camera setup), stops it
+#   7. pins the provider to the fast cores (its threads land on the slow ones otherwise)
+#   8. waits for the user's PipeWire and execs s24-cam serve
+unset LD_PRELOAD LD_LIBRARY_PATH
+A=/android
+HAL=/vendor/lib64/hw/camera.s5e9945.so
+PATCHED=/usr/local/share/s24/camera.s5e9945.hal11.so
+RT=/run/user/10000
+FAST=0x3f0     # cpus 4-9: A720 x5 + X4 (cpus 0-3 are the slow A520s)
+PROVIDER=android.hardware.camera.provider.ICameraProvider/internal/0
+
+log() { echo "$(date '+%F %T') s24-camera: $*"; }
+# every call into the container is time-limited: asked too early in boot, Android's `service`
+# tool spun at 100% of a core FOREVER (and the shell waiting on it ignored SIGTERM)
+setp() { timeout -s KILL 5 chroot $A /system/bin/setprop "$1" "$2" 2>/dev/null; }
+svc() { timeout -s KILL 5 chroot $A /system/bin/service check "$1" 2>/dev/null | sed 's/.*: //'; }
+fail() { log "$*"; echo s24-camera-setup > /sys/power/wake_unlock 2>/dev/null; exit 1; }
+
+echo s24-camera-setup > /sys/power/wake_lock 2>/dev/null
+
+# leftovers of an earlier run that was stopped mid-setup
+for p in $(pgrep -f '^/bin/sh /usr/local/sbin/s24-camera-run'); do [ "$p" != "$$" ] && kill -9 $p 2>/dev/null; done
+pkill -9 -f '^/system/bin/service check (android.hardware.thermal|vendor.samsung.hardware.hyper|android.hardware.camera.provider)' 2>/dev/null
+
+# an s24-cam from a hand-started bridge would publish the same camera nodes: stop it (SIGTERM
+# lets it hand back its frames and close the camera cleanly)
+for p in $(pgrep -f '^/(root|usr/local/sbin)/s24-cam[^ ]* (stream|serve) '); do kill -TERM $p 2>/dev/null; done
+pkill -f '^gst-launch-1.0 .*samsung_rear' 2>/dev/null
+sleep 3
+
+# 1. the container, with its service manager up (only then is it safe to ask it anything)
+IP=
+for i in $(seq 1 120); do
+	IP=$(pgrep -f 'init second_stage' | head -1)
+	[ -n "$IP" ] && pgrep -f '^/system/bin/servicemanager' >/dev/null &&
+		[ -n "$(svc android.hardware.thermal.IThermal/default)" ] && break
+	sleep 2
+done
+[ -n "$IP" ] || fail "the Android container is not running"
+[ -n "$(svc android.hardware.thermal.IThermal/default)" ] || fail "the container's service manager does not answer"
+nse() { nsenter -t $IP -m -r -- "$@"; }
+
+# 2. sensor modules (kernel-global; the pmOS rootfs lacks these .ko)
+S0=$(for p in $(pgrep -f 'busybox sh /init'); do [ -e /proc/$p/root/lib/modules ] && { echo $p; break; }; done)
+for m in votf pablo_libs is-cis-3k1 is-cis-gn3 is-cis-3lu is-cis-imx564 is-actuator-ak737x is-flash-s2mpb02-i2c smfc scaler; do
+	grep -q "^$(echo $m | tr - _) " /proc/modules && continue
+	[ -n "$S0" ] || fail "camera module $m is not loaded and the boot ramdisk was not found"
+	insmod /proc/$S0/root/lib/modules/$m.ko || fail "insmod $m failed"
+	log "loaded $m"
+done
+
+# 3. thermal + HyPer: their stock rc files have no seclabel, so the container's init can't start
+# them with SELinux off; run them in its mount namespace directly
+pkill -9 -f '^/vendor/bin/hw/vendor.samsung.hardware.(thermal|hyper)-service' 2>/dev/null
+sleep 1
+setsid nsenter -t $IP -m -- /vendor/bin/hw/vendor.samsung.hardware.thermal-service >/dev/null 2>&1 </dev/null &
+setsid nsenter -t $IP -m -- /vendor/bin/hw/vendor.samsung.hardware.hyper-service >/dev/null 2>&1 </dev/null &
+for i in $(seq 1 20); do
+	[ "$(svc android.hardware.thermal.IThermal/default)" = found ] &&
+	[ "$(svc vendor.samsung.hardware.hyper.ISehHyPer/default)" = found ] && break
+	sleep 1
+done
+[ "$(svc vendor.samsung.hardware.hyper.ISehHyPer/default)" = found ] || fail "HyPer service did not register"
+
+# 4. stop the camera services, bind the patched HAL
+setp ctl.stop cameraserver; setp ctl.stop sec-camera-provider; setp ctl.stop vendor.graphics.allocator-default
+setp s24.camera 0
+for p in $(pgrep -f '^(/system/bin/cameraserver|/vendor/bin/hw/[^ ]*(camera.provider-service|graphics.allocator)|/(root|usr/local/sbin)/s24-camd)'); do
+	kill -9 $p 2>/dev/null
+done
+sleep 2
+[ -f "$PATCHED" ] || fail "$PATCHED is missing"
+cp "$PATCHED" $A/data/camera.s5e9945.hal11.so || fail "copy of the patched HAL failed"
+n=0
+while nse sh -c "grep -q ' $HAL ' /proc/self/mountinfo" && [ $n -lt 30 ]; do nse umount "$HAL"; n=$((n + 1)); done
+nse mount --bind /data/camera.s5e9945.hal11.so "$HAL" || fail "bind of the patched HAL failed"
+
+# 5. the sensor service
+setsid /usr/local/sbin/s24-camd >> /var/log/s24-camd.log 2>&1 </dev/null &
+sleep 1
+
+# 6. prime: cameraserver's start-up calls are what make the provider build its full camera setup
+setp s24.camera 1
+for i in $(seq 1 30); do [ "$(svc $PROVIDER)" = found ] && break; sleep 1; done
+[ "$(svc $PROVIDER)" = found ] || fail "the camera provider did not register"
+sleep 8
+setp ctl.stop cameraserver
+sleep 2
+[ "$(svc $PROVIDER)" = found ] || fail "the camera provider went away while priming"
+
+# 7. fast cores + a clock floor for the provider
+PP=$(pgrep -f '^/vendor/bin/hw/[^ ]*camera.provider-service_64' | head -1)
+taskset -a -p $FAST $PP >/dev/null 2>&1
+uclampset -a -m 512 -p $PP >/dev/null 2>&1
+log "camera provider $PP ready"
+
+# 8. the user's PipeWire, then the cameras. After a reboot that waits for someone to log in,
+# which can take hours: wait without keeping the phone awake
+echo s24-camera-setup > /sys/power/wake_unlock 2>/dev/null
+[ -S $RT/pipewire-0 ] || log "waiting for the desktop session (PipeWire in $RT)"
+while [ ! -S $RT/pipewire-0 ]; do sleep 3; done
+uclampset -m 512 -p $$ >/dev/null 2>&1
+export XDG_RUNTIME_DIR=$RT S24CAM_NOPRIME=1 S24CAM_DEPTH=4
+log "starting s24-cam"
+exec taskset $FAST /usr/local/sbin/s24-cam serve device@1.1/internal/0,device@1.1/internal/1 1920x1080

@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# /etc/init.d/s24-mouse-mode (Claude, 2026-11-15): the root half of the S24's mouse mode
+# (s24-mouse-moded: the touchscreen as a touchpad while asked; /usr/local/bin/s24-mouse-mode
+# is the session half). It holds the touchscreen only while mouse mode is on and the panel lit.
+description="Mouse mode: the touchscreen as a touchpad, on request"
+supervisor=supervise-daemon
+command=/usr/local/sbin/s24-mouse-moded
+output_log=/var/log/s24-mouse-mode.log
+error_log=/var/log/s24-mouse-mode.log
+
+depend() {
+	after udev s24-power
+}
+
+start_pre() {
+	# A session that ended in mouse mode left KWin's zoom saved in kwinrc: the next
+	# login starts unzoomed (the session's own cleanup puts the rest back at login).
+	for home in /home/*; do
+		[ -f "$home/.cache/s24-mouse-mode/before.json" ] || continue
+		owner=$(stat -c %U "$home") || continue
+		su -s /bin/sh "$owner" -c 'kwriteconfig6 --file kwinrc --group Effect-zoom --key InitialZoom --delete' >/dev/null 2>&1
+	done
+	return 0
+}

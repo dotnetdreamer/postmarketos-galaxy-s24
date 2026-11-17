@@ -1,0 +1,39 @@
+#!/bin/sh
+# s24-greeter-reaper (Claude, 2026-11-15) - /usr/local/sbin on the Galaxy S24's postmarketOS.
+# phrog's greeter leaves ~35 processes running after every login (its PulseAudio, gnome-session,
+# evolution, GNOME Online Accounts, Calls...), in the cgroup elogind gave the greeter's session:
+# elogind doesn't kill a session's processes when it ends (KillUserProcesses=no). This kills what is
+# left in an ended session's cgroup when every process there is the greeter user's, once at start and
+# after each SessionRemoved. Never a live session, never anyone else's processes.
+GREETER_UID=$(id -u greetd 2>/dev/null) || exit 0
+CG=/sys/fs/cgroup
+LOG=/var/log/s24-greeter-reaper.log
+log() { echo "$(date '+%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+reap() {
+	for d in "$CG"/c[0-9]*; do
+		[ -d "$d" ] || continue
+		id=${d##*/}
+		[ -e "/run/systemd/sessions/$id" ] && continue # a live session
+		pids=$(cat "$d/cgroup.procs" 2>/dev/null)
+		[ -n "$pids" ] || continue
+		others=0
+		for p in $pids; do
+			u=$(stat -c %u "/proc/$p" 2>/dev/null) || continue
+			[ "$u" = "$GREETER_UID" ] || others=$((others + 1))
+		done
+		[ "$others" -eq 0 ] || continue # someone else's: not ours to end
+		n=$(echo $pids | wc -w)
+		echo 1 > "$d/cgroup.kill" && log "session $id had ended: killed its $n leftover greeter processes"
+	done
+}
+
+trap 'kill 0' TERM INT
+log "started"
+reap
+dbus-monitor --system "type='signal',interface='org.freedesktop.login1.Manager',member='SessionRemoved'" 2>/dev/null |
+while read -r line; do
+	case "$line" in
+	*member=SessionRemoved*) sleep 2; reap ;;
+	esac
+done

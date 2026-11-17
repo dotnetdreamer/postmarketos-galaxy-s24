@@ -1,0 +1,15 @@
+#!/bin/sh
+# s24-mobile-data (Claude, 2026-11-15): NetworkManager dispatcher.
+# - The mobile data interface came up (NetworkManager has put the address on): start clatd.
+# - Anything changed (Wi-Fi up/down, DNS): let the hook decide again whether /etc/resolv.conf
+#   needs the mobile DNS (only while NetworkManager has none); a second later, as NetworkManager
+#   writes the file first.
+R=/run/s24-mobile-data
+[ "$1" = clat ] && exit 0
+case "$2" in up | down | dns-change | connectivity-change) ;; *) exit 0 ;; esac
+[ -e $R/iface ] || exit 0
+if [ "$2" = up ] && [ "$1" = "$(cat $R/iface)" ]; then
+	/usr/local/sbin/s24-mobile-data-hook clat </dev/null >/dev/null 2>&1 &
+fi
+(sleep 1; /usr/local/sbin/s24-mobile-data-hook refresh) </dev/null >/dev/null 2>&1 &
+exit 0

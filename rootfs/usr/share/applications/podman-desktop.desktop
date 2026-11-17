@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Podman Desktop
+GenericName=Containers
+Comment=Manage containers and images
+Exec=/usr/local/bin/podman-desktop %U
+Icon=/opt/podman-desktop/podman-desktop.png
+Terminal=false
+Categories=Development;System;
+Keywords=container;containers;podman;docker;image;
+StartupWMClass=Podman Desktop

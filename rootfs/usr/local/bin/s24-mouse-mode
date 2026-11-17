@@ -1,0 +1,494 @@
+#!/usr/bin/python3
+# s24-mouse-mode (Claude, 2026-11-15): mouse mode for the Galaxy S24 on Plasma Mobile.
+"""Mouse mode: the touchscreen becomes a touchpad, the desktop gets bigger so desktop apps fit,
+and KWin's zoom shows it at the usual size and moves along when the pointer reaches an edge,
+like the mouse mode of a remote-control app.
+
+  s24-mouse-mode on | off | toggle | status   (the Mouse Mode quick setting runs these)
+  s24-mouse-mode cleanup                     put the session back after a run that did not end
+                                             (run at login, and by the touch service)
+
+The touch half is the root service s24-mouse-moded (/run/s24-mouse-mode.sock). While mouse mode
+is on, `s24-mouse-mode agent` runs in the session and owns org.s24.MouseMode on the session bus:
+  - lowers the phone screen's scale to BIG_SCALE and zooms in so things look as big as before;
+    KWin's zoom tracks the pointer in push mode (the view moves when the pointer reaches an edge),
+    a three-finger pinch zooms
+  - lets the on-screen keyboard open for the pointer (KWin's "any input" mode); while it is
+    open the screen is a touchscreen again, unzoomed, for typing
+  - a swipe in from the bottom edge opens the home screen, from the top edge the drawer
+  - ends when the panel goes dark, on a three-finger hold, when another screen is connected,
+    from the quick setting, or here; and puts back the scale, zoom and keyboard mode it found
+    (kept in ~/.cache/s24-mouse-mode/before.json until then)
+"""
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+BUS_NAME = 'org.s24.MouseMode'
+OBJ_PATH = '/org/s24/MouseMode'
+SOCK_PATH = '/run/s24-mouse-mode.sock'
+WATCH = '/usr/local/libexec/s24-output-watch'
+CACHE = os.path.join(os.environ.get('XDG_CACHE_HOME') or os.path.join(os.path.expanduser('~'), '.cache'),
+                     's24-mouse-mode')
+BEFORE = os.path.join(CACHE, 'before.json')
+LOG = os.path.join(CACHE, 'log')
+BIG_SCALE = 1.5          # the phone screen's scale in mouse mode (Plasma Mobile's own is 2.75)
+VK_ANY_INPUT = 2         # KWin VirtualKeyboard.mode: 0 never, 1 not for the mouse, 2 any input
+TRACK_PUSH = 2           # KWin zoom MouseTracking: 0 proportional, 1 centered, 2 push
+ZOOM_KEYS = ('MouseTracking', 'ZoomFactor')
+ABSENT = '\x01absent'
+# wl_output transform of the phone screen -> quarter turns for s24-mouse-moded. KWin maps a
+# touchscreen's panel point to the screen the same way (libinput/connection.cpp,
+# devicePointToGlobalPosition): Rotate90 (1) is (height - y, x), the daemon's 3; Rotate270 (3) is
+# (y, width - x), its 1.
+ROTATION = {0: 0, 1: 3, 2: 2, 3: 1}
+
+XML = """<node><interface name="org.s24.MouseMode">
+  <method name="On"/><method name="Off"/><method name="Toggle"/>
+  <property name="Enabled" type="b" access="read"/>
+</interface></node>"""
+
+
+def log(*args):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 256 * 1024:
+            os.replace(LOG, LOG + '.old')
+        with open(LOG, 'a') as f:
+            f.write('%s [%d] %s\n' % (time.strftime('%F %T'), os.getpid(), ' '.join(str(a) for a in args)))
+    except OSError:
+        pass
+
+
+def run(*cmd, timeout=15):
+    try:
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           text=True, timeout=timeout)
+        if r.returncode:
+            log('failed:', ' '.join(cmd), '->', r.returncode, r.stderr.strip()[:300])
+        return r
+    except (OSError, subprocess.SubprocessError) as e:
+        log('failed:', ' '.join(cmd), '->', e)
+        return None
+
+
+# ---- KDE, through its tools and D-Bus -----------------------------------------------------
+
+def kread(key):
+    r = run('kreadconfig6', '--file', 'kwinrc', '--group', 'Effect-zoom', '--key', key, '--default', ABSENT)
+    return None if r is None or r.stdout.strip() == ABSENT else r.stdout.strip()
+
+
+def kwrite(key, value):
+    if value is None:
+        run('kwriteconfig6', '--file', 'kwinrc', '--group', 'Effect-zoom', '--key', key, '--delete')
+    else:
+        run('kwriteconfig6', '--file', 'kwinrc', '--group', 'Effect-zoom', '--key', key, str(value))
+
+
+_bus = None
+
+
+def bus():
+    global _bus
+    if _bus is None:
+        from gi.repository import Gio
+        _bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return _bus
+
+
+def call(dest, path, iface, method, sig=None, args=None, reply=None, timeout=5000):
+    from gi.repository import Gio, GLib
+    try:
+        v = bus().call_sync(dest, path, iface, method, GLib.Variant(sig, args) if sig else None,
+                            GLib.VariantType(reply) if reply else None, Gio.DBusCallFlags.NONE, timeout, None)
+        return v.unpack() if v is not None else None
+    except Exception as e:  # GLib.Error: the other side is not there or said no
+        log('D-Bus %s.%s: %s' % (iface, method, e))
+        return None
+
+
+def get_prop(dest, path, iface, name):
+    r = call(dest, path, 'org.freedesktop.DBus.Properties', 'Get', '(ss)', (iface, name), '(v)')
+    return r[0] if r else None
+
+
+def set_prop(dest, path, iface, name, variant):
+    call(dest, path, 'org.freedesktop.DBus.Properties', 'Set', '(ssv)', (iface, name, variant))
+
+
+def has_owner(name):
+    r = call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'NameHasOwner',
+             '(s)', (name,), '(b)')
+    return bool(r and r[0])
+
+
+def shortcut(name):
+    call('org.kde.kglobalaccel', '/component/kwin', 'org.kde.kglobalaccel.Component', 'invokeShortcut',
+         '(s)', (name,))
+
+
+def reconfigure_zoom():
+    call('org.kde.KWin', '/Effects', 'org.kde.kwin.Effects', 'reconfigureEffect', '(s)', ('zoom',))
+
+
+def target_zoom():
+    r = call('org.kde.KWin', '/Effects', 'org.kde.kwin.Effects', 'supportInformation', '(s)', ('zoom',), '(s)')
+    for line in (r[0] if r else '').splitlines():
+        if line.startswith('targetZoom:'):
+            try:
+                return float(line.split(':', 1)[1])
+            except ValueError:
+                pass
+    return 1.0
+
+
+def zoom_to(level):
+    """KWin's zoom has no "zoom to" on D-Bus: back to 1, then one zoom-in step of the wanted size."""
+    shortcut('view_actual_size')
+    if level <= 1.001:
+        return
+    factor = kread('ZoomFactor')
+    kwrite('ZoomFactor', '%.4f' % level)
+    reconfigure_zoom()
+    shortcut('view_zoom_in')
+    kwrite('ZoomFactor', factor)
+    reconfigure_zoom()
+
+
+def vk_mode():
+    return get_prop('org.kde.KWin', '/VirtualKeyboard', 'org.kde.kwin.VirtualKeyboard', 'mode')
+
+
+def set_vk_mode(m):
+    from gi.repository import GLib
+    set_prop('org.kde.KWin', '/VirtualKeyboard', 'org.kde.kwin.VirtualKeyboard', 'mode', GLib.Variant('i', int(m)))
+
+
+def vk_visible():
+    return bool(get_prop('org.kde.KWin', '/VirtualKeyboard', 'org.kde.kwin.VirtualKeyboard', 'visible'))
+
+
+def phone_screen():
+    r = run('kscreen-doctor', '-j')
+    try:
+        outputs = json.loads(r.stdout)['outputs'] if r else []
+    except ValueError:
+        outputs = []
+    for o in outputs:
+        if o.get('enabled') and o.get('type') == 7:   # KScreen::Output::Panel
+            return o
+    return None
+
+
+def set_scale(name, scale):
+    run('kscreen-doctor', 'output.%s.scale.%s' % (name, ('%.4f' % scale).rstrip('0').rstrip('.')))
+
+
+def shell(method, sig=None, args=None, reply=None):
+    return call('org.kde.plasmashell', '/Mobile', 'org.kde.plasmashell', method, sig, args, reply)
+
+
+def notify(summary, body, timeout=6000, replaces=0):
+    from gi.repository import GLib
+    r = call('org.freedesktop.Notifications', '/org/freedesktop/Notifications', 'org.freedesktop.Notifications',
+             'Notify', '(susssasa{sv}i)',
+             ('Mouse Mode', replaces, 'input-touchpad', summary, body, [], {'urgency': GLib.Variant('y', 1)}, timeout),
+             '(u)')
+    return r[0] if r else 0
+
+
+def close_notify(nid):
+    if nid:
+        call('org.freedesktop.Notifications', '/org/freedesktop/Notifications', 'org.freedesktop.Notifications',
+             'CloseNotification', '(u)', (nid,))
+
+
+# ---- the saved state --------------------------------------------------------------------
+
+def restore_before():
+    """Put back what a run found, if a run left its notes. True if there was something."""
+    try:
+        with open(BEFORE) as f:
+            b = json.load(f)
+    except (OSError, ValueError):
+        return False
+    log('restoring', b)
+    shortcut('view_actual_size')
+    for key, value in b.get('zoom', {}).items():
+        kwrite(key, value)
+    kwrite('InitialZoom', None)       # KWin keeps the zoom across logins in it: none
+    reconfigure_zoom()
+    if b.get('vk_mode') is not None:
+        set_vk_mode(b['vk_mode'])
+    screen = phone_screen()
+    if b.get('scale') and screen and abs(screen.get('scale', 0) - b['scale']) > 0.001:
+        set_scale(b.get('screen') or screen['name'], b['scale'])
+    try:
+        os.unlink(BEFORE)
+    except OSError:
+        pass
+    return True
+
+
+# ---- the agent ----------------------------------------------------------------------------
+
+class Agent:
+    def __init__(self):
+        from gi.repository import GLib
+        self.loop = GLib.MainLoop()
+        self.sock = None
+        self.inbuf = b''
+        self.watch = None
+        self.watchbuf = b''
+        self.screens = {}
+        self.screens_ready = False
+        self.screen = None
+        self.zoom = 1.0
+        self.applied = False
+        self.stopping = False
+        self.typing = False
+        self.typing_zoom = 1.0
+        self.rotation = None
+        self.notif_id = 0
+
+    # D-Bus face
+    def on_call(self, conn, sender, path, iface, method, params, invocation):
+        from gi.repository import GLib
+        invocation.return_value(None)
+        if method in ('Off', 'Toggle'):
+            GLib.idle_add(self.stop, 'asked to')
+
+    def on_get(self, conn, sender, path, iface, prop):
+        from gi.repository import GLib
+        return GLib.Variant('b', not self.stopping)
+
+    def send(self, line):
+        try:
+            self.sock.sendall((line + '\n').encode())
+        except OSError as e:
+            log('send %s: %s' % (line, e))
+
+    def run(self):
+        from gi.repository import Gio, GLib
+        r = call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'RequestName',
+                 '(su)', (BUS_NAME, 4), '(u)')       # 4: do not queue
+        if not r or r[0] != 1:
+            log('another mouse mode is running')
+            return 0
+        node = Gio.DBusNodeInfo.new_for_xml(XML)
+        bus().register_object(OBJ_PATH, node.interfaces[0], self.on_call, self.on_get, None)
+        log('starting')
+        restore_before()      # a run that did not finish: back to what it found first
+        self.screen = phone_screen()
+        if not self.screen:
+            notify("Mouse mode couldn't start", "The phone's screen wasn't found.")
+            return 1
+        try:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.connect(SOCK_PATH)
+        except OSError as e:
+            log('touch service:', e)
+            notify("Mouse mode couldn't start", "The touch service (s24-mouse-mode) isn't running.")
+            return 1
+        GLib.io_add_watch(self.sock.fileno(), GLib.PRIORITY_DEFAULT, GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR,
+                          self.on_daemon)
+        try:
+            self.watch = subprocess.Popen([WATCH], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL)
+            GLib.io_add_watch(self.watch.stdout.fileno(), GLib.PRIORITY_DEFAULT,
+                              GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_screens)
+        except OSError as e:
+            log('screen watch:', e)
+        bus().signal_subscribe('org.kde.KWin', 'org.kde.kwin.VirtualKeyboard', 'visibleChanged',
+                               '/VirtualKeyboard', None, Gio.DBusSignalFlags.NONE, self.on_keyboard)
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self.stop, 'signal %d' % sig)
+        self.send('on')
+        self.loop.run()
+        return 0
+
+    # the touch service
+    def on_daemon(self, fd, cond):
+        try:
+            data = self.sock.recv(4096)
+        except OSError:
+            data = b''
+        if not data:
+            self.stop('the touch service stopped')
+            return False
+        self.inbuf += data
+        while b'\n' in self.inbuf:
+            line, self.inbuf = self.inbuf.split(b'\n', 1)
+            self.daemon_event(line.decode(errors='replace').split())
+        return True
+
+    def daemon_event(self, w):
+        if not w or self.stopping:
+            return
+        log('touch service:', ' '.join(w))
+        if w[0] == 'state' and w[1:] == ['on'] and not self.applied:
+            self.apply()
+        elif w[0] == 'exit':
+            why = w[1] if len(w) > 1 else ''
+            self.stop({'hold': 'three fingers held', 'dark': 'the screen went off'}.get(why, why or 'ended'))
+        elif w[0] == 'edge' and len(w) > 1:
+            if w[1] == 'bottom':
+                shell('openHomeScreen')
+            elif w[1] == 'top':
+                # swiping down from the top is what a phone user reaches for to "turn it off"
+                self.stop('you swiped down from the top')
+
+    def apply(self):
+        """The touchscreen is a touchpad now: the bigger desktop, the zoom, the keyboard."""
+        self.applied = True
+        before = {
+            'screen': self.screen['name'],
+            'scale': self.screen.get('scale'),
+            'vk_mode': vk_mode(),
+            'zoom': {key: kread(key) for key in ZOOM_KEYS},
+        }
+        os.makedirs(CACHE, exist_ok=True)
+        tmp = BEFORE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(before, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, BEFORE)
+        log('found', before)
+        scale = before['scale'] or BIG_SCALE
+        big = min(BIG_SCALE, scale)
+        self.zoom = scale / big
+        if big != scale:
+            set_scale(self.screen['name'], big)
+        set_vk_mode(VK_ANY_INPUT)
+        kwrite('MouseTracking', TRACK_PUSH)
+        reconfigure_zoom()
+        shortcut('MoveMouseToCenter')
+        zoom_to(self.zoom)
+        log('on: scale %s, zoom %.3f' % (big, self.zoom))
+        # a notification that stays up the whole time, so the way out is always on screen
+        self.notif_id = notify('Mouse mode is on',
+                               'To turn it off: swipe down from the very top of the screen '
+                               '(or hold three fingers).\n\n'
+                               'Drag = move the pointer. Tap = click. Two fingers = scroll / '
+                               'right-click. Three-finger pinch = zoom. Swipe up from the bottom = home.',
+                               timeout=0)
+        if vk_visible():
+            self.on_keyboard()
+
+    # the keyboard: open means typing, by touch, unzoomed
+    def on_keyboard(self, *args):
+        if self.stopping or not self.applied:
+            return
+        visible = vk_visible()
+        if visible and not self.typing:
+            self.typing = True
+            self.typing_zoom = target_zoom()
+            self.send('pause')
+            shortcut('view_actual_size')
+            log('keyboard open: touch, zoom 1 (was %.3f)' % self.typing_zoom)
+        elif not visible and self.typing:
+            self.typing = False
+            self.send('resume')
+            zoom_to(self.typing_zoom)
+            log('keyboard closed: touchpad, zoom %.3f' % self.typing_zoom)
+
+    # the screens: the phone's rotation; another screen ends mouse mode
+    def on_screens(self, fd, cond):
+        try:
+            data = os.read(fd, 4096)
+        except OSError:
+            data = b''
+        if not data:
+            return False
+        self.watchbuf += data
+        while b'\n' in self.watchbuf:
+            line, self.watchbuf = self.watchbuf.split(b'\n', 1)
+            w = line.decode(errors='replace').split()
+            if not w:
+                continue
+            if w[0] == 'output' and len(w) >= 3:
+                self.screens[w[1]] = int(w[2])
+            elif w[0] == 'dpms' and len(w) >= 3:
+                if w[1] == self.screen['name'] and w[2] != '0' and not os.environ.get('S24_MOUSE_MODE_IGNORE_DPMS'):
+                    self.stop('the screen went off')   # the touch service lets go too, by itself
+                    return False
+            elif w[0] == 'gone' and len(w) >= 2:
+                self.screens.pop(w[1], None)
+            elif w[0] == 'ready':
+                self.screens_ready = True
+            if self.screens_ready:
+                self.screens_changed()
+        return True
+
+    def screens_changed(self):
+        if self.stopping:
+            return
+        if len(self.screens) > 1:
+            self.stop('another screen is connected')
+            return
+        t = self.screens.get(self.screen['name'])
+        if t is not None:
+            r = ROTATION.get(t & 3, 0)
+            if r != self.rotation:
+                self.rotation = r
+                self.send('rotate %d' % r)
+                log('rotation: transform %d -> %d' % (t, r))
+
+    def stop(self, why='asked to'):
+        if self.stopping:
+            return False
+        self.stopping = True
+        log('stopping:', why)
+        if self.sock:
+            self.send('off')
+        restore_before()
+        close_notify(self.notif_id)
+        if self.watch:
+            self.watch.terminate()
+        call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus', 'ReleaseName',
+             '(s)', (BUS_NAME,), '(u)')
+        if why != 'asked to' and not why.startswith('signal'):
+            notify('Mouse mode is off', why[0].upper() + why[1:] + '.', timeout=4000)
+        self.loop.quit()
+        return False
+
+
+# ---- the command line -------------------------------------------------------------------
+
+def start_agent():
+    os.makedirs(CACHE, exist_ok=True)
+    out = open(LOG, 'a')
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), 'agent'], stdin=subprocess.DEVNULL,
+                     stdout=out, stderr=out, start_new_session=True, close_fds=True)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else 'toggle'
+    if cmd == 'agent':
+        return Agent().run()
+    if cmd not in ('on', 'off', 'toggle', 'status', 'cleanup'):
+        print(__doc__)
+        return 2
+    running = has_owner(BUS_NAME)
+    if cmd == 'status':
+        print('on' if running else 'off')
+    elif cmd == 'on' or (cmd == 'toggle' and not running):
+        if not running:
+            log('start asked')
+            start_agent()
+    elif running:   # off, toggle, cleanup with an agent running: it puts things back itself
+        call(BUS_NAME, OBJ_PATH, BUS_NAME, 'Off')
+    elif cmd in ('off', 'cleanup'):
+        if restore_before():
+            log('cleaned up (%s)' % cmd)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

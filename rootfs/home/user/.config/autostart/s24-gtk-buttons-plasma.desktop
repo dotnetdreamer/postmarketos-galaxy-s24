@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GTK window buttons in Plasma
+Comment=GNOME apps show minimize, maximize and close in Plasma (S24, 2026-11-15); Phosh puts 'appmenu:' back
+Exec=gsettings set org.gnome.desktop.wm.preferences button-layout 'appmenu:minimize,maximize,close'
+OnlyShowIn=KDE;
+NoDisplay=true
+X-KDE-autostart-phase=PreparationPhase

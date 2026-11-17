@@ -1,0 +1,40 @@
+Galaxy S24 postmarketOS (Claude, 2026-11-15): without timer scheduling, write whole periods only,
+one snd_pcm_writei() each. The phone's ABOX DSP (Samsung "calliope" virtual PCMs) takes every write
+as one whole period (the driver sends one "VPCM ACK" per write and the firmware books 3840 bytes for
+each), so the partial writes PulseAudio made whenever it had resampled or a client's chunks didn't
+line up with periods were counted twice: the DSP's mixer overflowed ("overflow detected. drain
+sink"), drained and played silence, which was audible as stutter. Steady, period-sized writes (as
+aplay and Android do) never trigger it. Mmap and timer-scheduled sinks are untouched.
+
+--- a/src/modules/alsa/alsa-sink.c
++++ b/src/modules/alsa/alsa-sink.c
+@@ -887,6 +887,14 @@
+         n_bytes -= u->hwbuf_unused;
+         polled = false;
+ 
++        /* Whole periods only when scheduling by period interrupts (see the patch header). */
++        if (!u->use_tsched) {
++            n_bytes -= n_bytes % u->fragment_size;
++
++            if (n_bytes <= 0)
++                break;
++        }
++
+         for (;;) {
+             snd_pcm_sframes_t frames;
+             void *p;
+@@ -894,8 +902,12 @@
+ 
+ /*         pa_log_debug("%lu frames to write", (unsigned long) frames); */
+ 
+-            if (u->memchunk.length <= 0)
+-                pa_sink_render(u->sink, n_bytes, &u->memchunk);
++            if (u->memchunk.length <= 0) {
++                if (u->use_tsched)
++                    pa_sink_render(u->sink, n_bytes, &u->memchunk);
++                else
++                    pa_sink_render_full(u->sink, u->fragment_size, &u->memchunk);
++            }
+ 
+             pa_assert(u->memchunk.length > 0);
+ 

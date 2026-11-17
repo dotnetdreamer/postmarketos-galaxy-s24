@@ -1,0 +1,24 @@
+#!/bin/sh
+# /usr/local/bin/brave (Galaxy S24 postmarketOS; Claude, 2026-11-16): Brave's official linux-arm64
+# build (/opt/brave, from GitHub release v1.99.57; its checksum file's signature checked against
+# Brave's "Checksums Release" key B840107020F8BED83CF7696DEDC0814C91A8144D from
+# brave.com/signing-keys), run natively on the same glibc runtime and GPU stack as VS Code: see
+# /usr/local/bin/code for why each variable and switch. The sandbox stays on through Chromium's
+# setuid helper (/opt/brave/chrome-sandbox, root, mode 4755): this kernel has no user or PID
+# namespaces, so it sandboxes without them (seccomp filters), like Alpine's own Chromium.
+# Flathub's Brave can't be used here: Flatpak needs the user namespaces this kernel lacks.
+#  s24-fit flag 500   Brave's window never goes below 500 px; on the 393 px phone screen it draws
+#                     itself smaller so it fits (see /usr/local/bin/s24-fit). It runs first: it
+#                     uses musl programs, which the glibc variables below would break.
+fit=$(/usr/local/bin/s24-fit flag 500)
+G=/var/lib/flatpak/runtime/org.freedesktop.Platform.GL.default/aarch64/25.08/active/files
+unset LD_PRELOAD
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export LIBGL_DRIVERS_PATH=$G/lib/dri GBM_BACKENDS_PATH=$G/lib/gbm
+export __EGL_VENDOR_LIBRARY_FILENAMES=$G/share/glvnd/egl_vendor.d/50_mesa.json
+export VK_DRIVER_FILES=/opt/xclipse-glibc/xclipse_icd.json VK_ICD_FILENAMES=/opt/xclipse-glibc/xclipse_icd.json
+# what Brave's own launcher sets: how to start itself again, and its desktop file (its window's
+# Wayland app id, so the task switcher shows Brave's icon)
+export CHROME_WRAPPER=/usr/local/bin/brave CHROME_VERSION_EXTRA=stable CHROME_DESKTOP=brave-browser.desktop
+exec /opt/brave/brave --ozone-platform=wayland --enable-wayland-ime --wayland-text-input-version=3 \
+	--disable-gpu-rasterization --disable-accelerated-2d-canvas $fit "$@"

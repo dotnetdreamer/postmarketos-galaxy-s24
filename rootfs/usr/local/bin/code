@@ -1,0 +1,38 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): Microsoft's official VS Code (the linux-arm64 tarball
+# in /opt/vscode), run natively on the glibc 2.42 of the Flathub freedesktop-sdk 25.08 runtime
+# (linked at /lib/ld-linux-aarch64.so.1 and /usr/lib/aarch64-linux-gnu, the rest found through
+# /etc/ld.so.cache; musl ignores all three), drawing on the GPU: the glibc Mesa of the Flathub GL
+# extension (zink) on the glibc build of the Xclipse Vulkan driver in /opt/xclipse-glibc.
+# The GPU variables point at glibc libraries, so VS Code's terminals clear them again
+# (terminal.integrated.env.linux): the phone's own GPU programs must not inherit them.
+#  LD_PRELOAD   /etc/environment preloads the display fix libs24fbfix.so (a musl library, only the
+#               compositor needs it); a glibc program can't load it
+#  --ozone-platform=wayland  native Wayland (VS Code would pick X11 through Xwayland)
+#  --enable-wayland-ime=1 --wayland-text-input-version=3  the on-screen keyboard
+#  --disable-gpu-rasterization=1 --disable-accelerated-2d-canvas=1  Skia's GPU path rendering
+#               draws shapes wrong on this GPU stack; page content and canvas are drawn by the CPU,
+#               compositing, scrolling and the WebGL terminal stay on the GPU
+#  Chromium switches VS Code doesn't know are written --switch=1: otherwise its argument parser
+#  takes the next argument (a file to open) as their value.
+#  s24-fit flag 432 (2026-11-16)  VS Code's window never goes below 432 px; on the 393 px phone
+#               screen it draws itself smaller (0.9) so it fits (see /usr/local/bin/s24-fit). It
+#               runs first: it uses musl programs, which the glibc variables below would break.
+fit=$(/usr/local/bin/s24-fit flag 432)
+G=/var/lib/flatpak/runtime/org.freedesktop.Platform.GL.default/aarch64/25.08/active/files
+unset LD_PRELOAD
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export LIBGL_DRIVERS_PATH=$G/lib/dri GBM_BACKENDS_PATH=$G/lib/gbm
+export __EGL_VENDOR_LIBRARY_FILENAMES=$G/share/glvnd/egl_vendor.d/50_mesa.json
+export VK_DRIVER_FILES=/opt/xclipse-glibc/xclipse_icd.json VK_ICD_FILENAMES=/opt/xclipse-glibc/xclipse_icd.json
+# command-line-only uses don't open a window: no Chromium switches (VS Code warns about each)
+case "$1" in tunnel|serve-web) exec /opt/vscode/bin/code "$@" ;; esac
+for a in "$@"; do
+	case "$a" in
+	-v|--version|-h|--help|-s|--status|--list-extensions|--show-versions|--install-extension|\
+	--uninstall-extension|--update-extensions|--locate-extension|--locate-shell-integration-path|\
+	--telemetry) exec /opt/vscode/bin/code "$@" ;;
+	esac
+done
+exec /opt/vscode/bin/code --ozone-platform=wayland --enable-wayland-ime=1 --wayland-text-input-version=3 \
+	--disable-gpu-rasterization=1 --disable-accelerated-2d-canvas=1 $fit "$@"

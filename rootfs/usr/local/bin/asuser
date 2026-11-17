@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Run a command as the logged-in user, with the exact environment of their session (the phosh
+process, or plasmashell under Plasma Mobile) (Galaxy S24 bring-up tests, Claude 2026-11-14/15). Extra VAR=value arguments before -- override.
+  asuser.py [--initgroups] [VAR=value ...] -- command args...
+--initgroups: groups from /etc/group now, not the session's (a group added after login)."""
+import os
+import sys
+
+SESSION_PROGS = (b"/usr/libexec/phosh", b"/usr/bin/plasmashell", b"plasmashell")
+pid = None
+for prog in SESSION_PROGS:
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            try:
+                if open("/proc/%s/cmdline" % p, "rb").read().split(b"\0")[0] == prog:
+                    pid = p
+                    break
+            except OSError:
+                pass
+    if pid:
+        break
+if pid is None:
+    sys.exit("no phosh or plasmashell session running")
+st = os.stat("/proc/" + pid)
+env = {}
+for item in open("/proc/%s/environ" % pid, "rb").read().split(b"\0"):
+    if b"=" in item:
+        k, v = item.split(b"=", 1)
+        env[k.decode()] = v.decode(errors="replace")
+args = sys.argv[1:]
+initgroups = bool(args) and args[0] == "--initgroups"
+if initgroups:
+    args.pop(0)
+while args and args[0] != "--":
+    k, v = args.pop(0).split("=", 1)
+    env[k] = v
+args = args[1:]
+groups = []
+for line in open("/proc/%s/status" % pid):
+    if line.startswith("Groups:"):
+        groups = [int(g) for g in line.split()[1:]]
+if initgroups:
+    import pwd
+    os.initgroups(pwd.getpwuid(st.st_uid).pw_name, st.st_gid)
+else:
+    os.setgroups(groups)  # the session's own supplementary groups (audio, video, ...)
+os.setgid(st.st_gid)
+os.setuid(st.st_uid)
+os.chdir(env.get("HOME", "/"))
+os.execvpe(args[0], args, env)

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): update the official VS Code in /opt/vscode to
+# Microsoft's latest stable linux-arm64 build (a tarball install never updates itself).
+# Run as root, with VS Code closed:  vscode-update
+set -e
+url=https://update.code.visualstudio.com/latest/linux-arm64/stable
+tmp=$(mktemp -d /var/tmp/vscode-update.XXXXXX)
+trap 'rm -rf "$tmp"' EXIT
+curl -fL -o "$tmp/code.tar.gz" "$url"
+mkdir "$tmp/new"
+tar xzf "$tmp/code.tar.gz" -C "$tmp/new" --strip-components=1
+# the archive carries its build machine's owner (uid 1000) and a setuid bit: root owns it here,
+# and chrome-sandbox is setuid root, as Microsoft's .deb sets it (Chromium's sandbox needs it)
+chown -R root:root "$tmp/new"
+chmod 4755 "$tmp/new/chrome-sandbox"
+old=$(grep -m1 '"version"' /opt/vscode/resources/app/package.json 2>/dev/null | cut -d'"' -f4)
+new=$(grep -m1 '"version"' "$tmp/new/resources/app/package.json" | cut -d'"' -f4)
+rm -rf /opt/vscode.old
+[ -d /opt/vscode ] && mv /opt/vscode /opt/vscode.old
+mv "$tmp/new" /opt/vscode
+rm -rf /opt/vscode.old
+echo "VS Code ${old:-none} -> $new"

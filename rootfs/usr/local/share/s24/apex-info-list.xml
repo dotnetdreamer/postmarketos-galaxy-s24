@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<apex-info-list>
+    <apex-info moduleName="com.android.runtime" modulePath="/system/apex/com.android.runtime.apex" preinstalledModulePath="/system/apex/com.android.runtime.apex" versionCode="1" versionName="" isFactory="true" isActive="true" lastUpdateMillis="0" provideSharedApexLibs="false" partition="SYSTEM"></apex-info>
+    <apex-info moduleName="com.android.i18n" modulePath="/system/apex/com.android.i18n.apex" preinstalledModulePath="/system/apex/com.android.i18n.apex" versionCode="1" versionName="" isFactory="true" isActive="true" lastUpdateMillis="0" provideSharedApexLibs="false" partition="SYSTEM"></apex-info>
+    <apex-info moduleName="com.android.vndk.v34" modulePath="/system_ext/apex/com.android.vndk.v34.apex" preinstalledModulePath="/system_ext/apex/com.android.vndk.v34.apex" versionCode="1" versionName="" isFactory="true" isActive="true" lastUpdateMillis="0" provideSharedApexLibs="false" partition="SYSTEM_EXT"></apex-info>
+</apex-info-list>

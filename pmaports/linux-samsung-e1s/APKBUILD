@@ -1,0 +1,19 @@
+# Placeholder kernel package for the Galaxy S24 bring-up: the phone runs Samsung stock kernel
+# straight from its BOOT partition, so this only satisfies pmbootstrap (no kernel is built).
+pkgname=linux-samsung-e1s
+pkgver=6.1.93
+pkgrel=0
+pkgdesc="Galaxy S24 (Exynos) stock kernel placeholder"
+arch="aarch64"
+_carch="arm64"
+_flavor="samsung-e1s"
+url="https://opensource.samsung.com"
+license="GPL-2.0-only"
+options="!strip !check !tracedeps pmb:cross-native"
+source=""
+
+package() {
+	mkdir -p "$pkgdir"/boot "$pkgdir"/usr/share/kernel/$_flavor
+	: > "$pkgdir"/boot/vmlinuz
+	echo "6.1.93-android14-11" > "$pkgdir"/usr/share/kernel/$_flavor/kernel.release
+}

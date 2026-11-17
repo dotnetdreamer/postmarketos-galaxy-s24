@@ -1,0 +1,56 @@
+#!/sbin/openrc-run
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): Bluetooth (Qualcomm WCN7851 on /dev/ttySAC1).
+# Loads Samsung's btpower driver and s24bt, my self-contained Bluetooth kernel module (the whole
+# stack in one module that exports nothing: Samsung's kernel stubs the HCI socket BlueZ needs, and
+# GKI signing rejects a rebuilt bluetooth.ko), then runs s24-bt: it powers the chip, loads its
+# firmware with the address from /etc/s24/bt_addr and hands the line to the kernel's Qualcomm
+# protocol. hci0 lives as long as s24-bt runs. s24bt can't be unloaded (RFCOMM's own listening
+# socket holds it); stopping this service just takes hci0 away.
+description="Galaxy S24 Bluetooth chip (hci0)"
+supervisor=supervise-daemon
+command=/usr/local/sbin/s24-bt
+command_args="up -a /etc/s24/bt_addr"
+output_log=/var/log/s24-bt.log
+error_log=/var/log/s24-bt.log
+respawn_delay=5
+respawn_max=3
+
+depend() {
+	before bluetooth
+}
+
+start_pre() {
+	f=/var/log/s24-bt.log
+	[ -f $f ] && [ "$(wc -c < $f)" -gt 200000 ] && : > $f
+	fresh=
+	if ! grep -q '^btpower ' /proc/modules; then
+		insmod /usr/local/lib/s24/btpower.ko || return 1
+		fresh=1
+	fi
+	grep -q '^s24bt ' /proc/modules || insmod /usr/local/lib/s24/s24bt.ko || return 1
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		[ -e /dev/btpower ] && break
+		sleep 1
+	done
+	if [ ! -e /dev/btpower ]; then
+		eerror "no /dev/btpower"
+		return 1
+	fi
+	# the chip's first start after btpower loads leaves btpower's "BT_host_wake" wakeup source
+	# held for good (the phone could never sleep); a stop and a second start don't. So the first
+	# time, run it once until hci0 is up and stop it again (a few seconds)
+	if [ -n "$fresh" ]; then
+		w=/var/log/s24-bt-warmup.log
+		/usr/local/sbin/s24-bt up -a /etc/s24/bt_addr > $w 2>&1 &
+		pid=$!
+		for i in $(seq 1 30); do
+			grep -q -E 'attached as|s24-bt: (no|chip|HCI|TIOCSETD)' $w 2>/dev/null && break
+			sleep 1
+		done
+		sleep 2
+		kill $pid 2> /dev/null
+		wait $pid 2> /dev/null
+		sleep 1
+	fi
+	return 0
+}

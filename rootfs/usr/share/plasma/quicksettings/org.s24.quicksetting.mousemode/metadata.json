@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "KPackage/GenericQML",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Claude"
+            }
+        ],
+        "Description": "Use the touchscreen as a touchpad, with a bigger desktop that follows the pointer",
+        "Icon": "input-touchpad",
+        "Id": "org.s24.quicksetting.mousemode",
+        "License": "GPL",
+        "Name": "Mouse Mode"
+    }
+}

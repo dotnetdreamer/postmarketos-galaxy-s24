@@ -1,0 +1,8 @@
+#!/bin/sh
+# Galaxy S24 postmarketOS (Claude, 2026-11-15), run by OpenRC's "local" service at boot: rebuild the
+# library cache of the glibc programs (official VS Code) from /etc/glibc-ld.so.conf, so a flatpak
+# update of their runtime or GL extension can't leave it stale. musl never reads /etc/ld.so.cache.
+# -X: don't create symlinks inside the flatpak deploy directories.
+L=/var/lib/flatpak/runtime/org.freedesktop.Sdk/aarch64/25.08/active/files/sbin/ldconfig
+[ -x "$L" ] && "$L" -X -f /etc/glibc-ld.so.conf -C /etc/ld.so.cache 2>/dev/null
+exit 0

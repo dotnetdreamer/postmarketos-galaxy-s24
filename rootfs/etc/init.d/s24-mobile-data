@@ -1,0 +1,31 @@
+#!/sbin/openrc-run
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): mobile data through Samsung's own modem stack:
+# rild in the Android container (android-ctr0.sh) + s24-radio, which keeps the data call up.
+# The supervised program (s24-mobile-data-run) starts the container and waits for the modem in
+# the background, so boot doesn't wait for it; s24-mobile-data-hook handles DNS and IPv4 (clatd).
+# Settings: /etc/conf.d/s24-mobile-data. Log: /var/log/s24-mobile-data.log.
+
+description="Mobile data (Samsung modem, Android container + s24-radio)"
+
+: ${APN:=auto}
+: ${SLOT:=1}
+supervisor=supervise-daemon
+command=/usr/local/sbin/s24-mobile-data-run
+command_args=""
+supervise_daemon_args="--env APN=$APN --env SLOT=$SLOT"
+output_log=/var/log/s24-mobile-data.log
+error_log=/var/log/s24-mobile-data.log
+respawn_delay=30
+respawn_max=0
+
+depend() {
+	need localmount
+	after NetworkManager s24-sensors s24-bluetooth
+}
+
+stop_post() {
+	/usr/local/sbin/s24-mobile-data-hook down - >/dev/null 2>&1
+	# airplane mode for the radio; the container stays (a restart reuses it)
+	S24_SLOT=$SLOT timeout 15 /usr/local/bin/s24-radio power off >/dev/null 2>&1
+	return 0
+}

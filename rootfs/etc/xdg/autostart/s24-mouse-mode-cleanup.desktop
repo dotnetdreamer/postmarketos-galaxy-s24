@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Mouse mode cleanup
+Comment=Puts the screen scale, zoom and keyboard back if a mouse-mode run did not end (Galaxy S24)
+Exec=/usr/local/bin/s24-mouse-mode cleanup
+OnlyShowIn=KDE;
+NoDisplay=true
+X-KDE-autostart-phase=1

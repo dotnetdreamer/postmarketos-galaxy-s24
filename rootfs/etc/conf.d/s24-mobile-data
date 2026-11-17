@@ -1,0 +1,5 @@
+# Mobile data (rc-service s24-mobile-data start|stop|restart)
+# APN: "auto" picks it from the phone's own APN list for the SIM; or name it, e.g. APN=internet
+APN=auto
+# SIM slot: 1 or 2
+SLOT=1

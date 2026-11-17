@@ -1,0 +1,18 @@
+#!/bin/sh
+# Galaxy S24 (Exynos 2400) performance setup for postmarketOS, run by OpenRC's "local" service at
+# boot (Claude, 2026-11-14). Android does these through Samsung's power HAL; nothing here does
+# them otherwise.
+#  - CPU: the standard schedutil governor on all four clusters (A520 x4, A720 x3, A720 x2, X4 x1)
+#    instead of Samsung's energy_aware, which expects hints from Android; re-evaluated every 1 ms
+#    instead of 10 ms. Every core still reaches its full clock (measured: X4 3207 MHz).
+#  - Touch boost: Samsung's input_booster raises CPU/memory clocks for ~1 s after a touch, but
+#    only once enable_event is 1 (Android's framework sets it).
+#  - Memory (MIF) and GPU keep their own governors: MIF already jumps to 4206 MHz under load.
+# The kernel's thermal zones still throttle at 90/100/105 C, so this is safe for the chip.
+
+for p in /sys/devices/system/cpu/cpufreq/policy*; do
+	echo schedutil > "$p/scaling_governor" 2>/dev/null
+	[ -w "$p/schedutil/rate_limit_us" ] && echo 1000 > "$p/schedutil/rate_limit_us"
+done
+[ -w /sys/class/input_booster/enable_event ] && echo 1 > /sys/class/input_booster/enable_event
+exit 0

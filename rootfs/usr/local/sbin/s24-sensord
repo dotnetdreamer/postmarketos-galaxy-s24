@@ -1,0 +1,291 @@
+#!/usr/bin/python3
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): sensor service for Samsung's sensor hub (the CHUB
+# microcontroller, driven by the stock "shub" kernel driver). It offers the standard
+# net.hadess.SensorProxy D-Bus interface, the one iio-sensor-proxy offers, which Phosh, KWin/Plasma and
+# GNOME use for screen rotation, automatic brightness and the proximity check during calls.
+# iio-sensor-proxy itself can't read this hub: every sensor is one IIO device carrying a raw record.
+#
+# How the hub is driven (what Samsung's Android sensor HAL does):
+#  - /sys/class/sensors/ssp_sensor/fs_ready <- 1 boots the hub (loads /vendor/firmware/os.checked.bin);
+#    done once by the OpenRC service before this program starts
+#  - ioctl(/dev/batch_io, 0xFC00 | type, {s64 max_latency_ns, s64 period_ns, s32 flags}) sets the rate
+#  - /sys/class/sensors/ssp_sensor/enable <- type*10+1 switches a sensor on, type*10 off
+#  - each sensor has an IIO device (name = Samsung's sensor name) whose buffer yields fixed-size
+#    records: the sensor's payload, then a little-endian u64 timestamp
+# A hub sensor runs only while some program has claimed it. Orientation comes from the hub's own
+# "device orientation" sensor (Android sensor type 27: the hub works it out, the main CPU sleeps).
+import os, sys, struct, fcntl, glob, time
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+
+SSP = '/sys/class/sensors/ssp_sensor'
+BUS_NAME = 'net.hadess.SensorProxy'
+PATH = '/net/hadess/SensorProxy'
+COMPASS_PATH = '/net/hadess/SensorProxy/Compass'
+
+# claim group -> hub sensor: (Samsung type, IIO name, payload bytes, period ms)
+SENSORS = {
+    'accel': (27, 'device_orientation', 1, 200),
+    'light': (5, 'light_sensor', 4, 200),
+    'prox': (8, 'proximity_sensor', 1, 200),
+}
+# Android device-orientation values -> iio-sensor-proxy names ("right-up" = the right edge points up)
+ORIENTATION = {0: 'normal', 1: 'right-up', 2: 'bottom-up', 3: 'left-up'}
+
+XML = '''
+<node>
+  <interface name="net.hadess.SensorProxy">
+    <method name="ClaimAccelerometer"/>
+    <method name="ReleaseAccelerometer"/>
+    <method name="ClaimLight"/>
+    <method name="ReleaseLight"/>
+    <method name="ClaimProximity"/>
+    <method name="ReleaseProximity"/>
+    <property name="HasAccelerometer" type="b" access="read"/>
+    <property name="AccelerometerOrientation" type="s" access="read"/>
+    <property name="AccelerometerTilt" type="s" access="read"/>
+    <property name="HasAmbientLight" type="b" access="read"/>
+    <property name="LightLevelUnit" type="s" access="read"/>
+    <property name="LightLevel" type="d" access="read"/>
+    <property name="HasProximity" type="b" access="read"/>
+    <property name="ProximityNear" type="b" access="read"/>
+  </interface>
+</node>'''
+COMPASS_XML = '''
+<node>
+  <interface name="net.hadess.SensorProxy.Compass">
+    <method name="ClaimCompass"/>
+    <method name="ReleaseCompass"/>
+    <property name="HasCompass" type="b" access="read"/>
+    <property name="CompassHeading" type="d" access="read"/>
+  </interface>
+</node>'''
+
+
+def log(*a):
+    print(time.strftime('%H:%M:%S'), *a, file=sys.stderr, flush=True)
+
+
+def wsys(path, val):
+    # the shub enable store returns odd lengths; the write itself goes through
+    try:
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            os.write(fd, val.encode())
+        finally:
+            os.close(fd)
+        return True
+    except OSError as e:
+        log('write', path, val, e)
+        return False
+
+
+def iio_dir(name):
+    for d in glob.glob('/sys/bus/iio/devices/iio:device*'):
+        try:
+            if open(d + '/name').read().strip() == name:
+                return d
+        except OSError:
+            pass
+    return None
+
+
+def hub_running():
+    try:
+        with open(SSP + '/sensor_spec', 'rb') as f:
+            return len(f.read(16)) > 0
+    except OSError:
+        return False
+
+
+class Sensor:
+    def __init__(self, key, on_value):
+        self.key = key
+        self.type, self.name, self.size, self.period = SENSORS[key]
+        self.dir = iio_dir(self.name)
+        self.on_value = on_value
+        self.fd = None
+        self.watch = None
+
+    @property
+    def present(self):
+        return self.dir is not None
+
+    def start(self):
+        if self.fd is not None or not self.present:
+            return
+        wsys(self.dir + '/buffer/enable', '0')
+        wsys(self.dir + '/buffer/length', '128')
+        wsys(self.dir + '/buffer/enable', '1')
+        self.fd = os.open('/dev/' + os.path.basename(self.dir), os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            bio = os.open('/dev/batch_io', os.O_RDWR)
+            try:
+                fcntl.ioctl(bio, 0xFC00 | self.type, struct.pack('<qqi4x', 0, self.period * 1000000, 0))
+            finally:
+                os.close(bio)
+        except OSError as e:
+            log('batch', self.name, e)
+        wsys(SSP + '/enable', str(self.type * 10 + 1))
+        self.watch = GLib.io_add_watch(self.fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, self._readable)
+        log('on', self.name)
+
+    def stop(self):
+        if self.fd is None:
+            return
+        wsys(SSP + '/enable', str(self.type * 10))
+        GLib.source_remove(self.watch)
+        os.close(self.fd)
+        self.fd = self.watch = None
+        wsys(self.dir + '/buffer/enable', '0')
+        log('off', self.name)
+
+    def _readable(self, fd, cond):
+        rec = self.size + 8
+        try:
+            data = os.read(fd, rec * 64)
+        except BlockingIOError:
+            return True
+        except OSError as e:
+            log('read', self.name, e)
+            return True
+        for i in range(0, len(data) - rec + 1, rec):
+            self.on_value(data[i:i + self.size])
+        return True
+
+
+class Proxy:
+    def __init__(self):
+        self.orientation = 'undefined'
+        self.light = 0.0
+        self.near = False
+        self.conn = None
+        self.claims = {k: set() for k in SENSORS}
+        self.watches = {}
+        self.sensors = {
+            'accel': Sensor('accel', self._orientation),
+            'light': Sensor('light', self._light),
+            'prox': Sensor('prox', self._prox),
+        }
+        self.node = Gio.DBusNodeInfo.new_for_xml(XML)
+        self.cnode = Gio.DBusNodeInfo.new_for_xml(COMPASS_XML)
+
+    # --- sensor values -------------------------------------------------------------------
+    def _orientation(self, p):
+        o = ORIENTATION.get(p[0])  # 255 = unknown (lying flat): keep the last one
+        if o and o != self.orientation:
+            self.orientation = o
+            log('orientation', o)
+            self._changed({'AccelerometerOrientation': GLib.Variant('s', o)})
+
+    def _light(self, p):
+        lux = float(struct.unpack('<I', p)[0])
+        if lux != self.light:
+            self.light = lux
+            self._changed({'LightLevel': GLib.Variant('d', lux)})
+
+    def _prox(self, p):
+        near = p[0] != 0
+        if near != self.near:
+            self.near = near
+            log('proximity', 'near' if near else 'far')
+            self._changed({'ProximityNear': GLib.Variant('b', near)})
+
+    def _changed(self, props):
+        if self.conn:
+            self.conn.emit_signal(None, PATH, 'org.freedesktop.DBus.Properties', 'PropertiesChanged',
+                                  GLib.Variant('(sa{sv}as)', ('net.hadess.SensorProxy', props, [])))
+
+    # --- claims ----------------------------------------------------------------------------
+    def _claim(self, key, sender):
+        s = self.sensors[key]
+        if not s.present:
+            return
+        if key == 'prox' and s.fd is None and self.near:
+            # a stale "near" from the last time must not count until the hub reports again
+            self.near = False
+            self._changed({'ProximityNear': GLib.Variant('b', False)})
+        self.claims[key].add(sender)
+        if sender not in self.watches:
+            self.watches[sender] = Gio.bus_watch_name_on_connection(
+                self.conn, sender, Gio.BusNameWatcherFlags.NONE, None, self._vanished)
+        s.start()
+
+    def _release(self, key, sender):
+        self.claims[key].discard(sender)
+        if not self.claims[key]:
+            self.sensors[key].stop()
+        if not any(sender in c for c in self.claims.values()) and sender in self.watches:
+            Gio.bus_unwatch_name(self.watches.pop(sender))
+
+    def _vanished(self, conn, name):
+        for key in SENSORS:
+            if name in self.claims[key]:
+                self._release(key, name)
+
+    # --- D-Bus -----------------------------------------------------------------------------
+    def _call(self, conn, sender, path, iface, method, params, inv):
+        if method.startswith('Claim') or method.startswith('Release'):
+            what = method[5:] if method.startswith('Claim') else method[7:]
+            key = {'Accelerometer': 'accel', 'Light': 'light', 'Proximity': 'prox'}.get(what)
+            if key:
+                (self._claim if method.startswith('Claim') else self._release)(key, sender)
+            inv.return_value(None)
+            return
+        inv.return_dbus_error('org.freedesktop.DBus.Error.UnknownMethod', method)
+
+    def _get(self, conn, sender, path, iface, prop):
+        if iface == 'net.hadess.SensorProxy.Compass':
+            return GLib.Variant('b', False) if prop == 'HasCompass' else GLib.Variant('d', 0.0)
+        return {
+            'HasAccelerometer': GLib.Variant('b', self.sensors['accel'].present),
+            'AccelerometerOrientation': GLib.Variant('s', self.orientation),
+            'AccelerometerTilt': GLib.Variant('s', 'undefined'),
+            'HasAmbientLight': GLib.Variant('b', self.sensors['light'].present),
+            'LightLevelUnit': GLib.Variant('s', 'lux'),
+            'LightLevel': GLib.Variant('d', self.light),
+            'HasProximity': GLib.Variant('b', self.sensors['prox'].present),
+            'ProximityNear': GLib.Variant('b', self.near),
+        }.get(prop)
+
+    def _compass_call(self, conn, sender, path, iface, method, params, inv):
+        inv.return_value(None)
+
+    def bus_acquired(self, conn, name):
+        self.conn = conn
+        conn.register_object(PATH, self.node.interfaces[0], self._call, self._get, None)
+        conn.register_object(COMPASS_PATH, self.cnode.interfaces[0], self._compass_call, self._get, None)
+
+    def stop_all(self):
+        for s in self.sensors.values():
+            s.stop()
+
+
+def main():
+    for i in range(30):  # the service boots the hub just before; give it time
+        if hub_running():
+            break
+        time.sleep(1)
+    else:
+        log('sensor hub not running: no sensors')
+    p = Proxy()
+    log('sensors:', ', '.join('%s=%s' % (k, s.dir) for k, s in p.sensors.items()))
+    loop = GLib.MainLoop()
+    Gio.bus_own_name(Gio.BusType.SYSTEM, BUS_NAME, Gio.BusNameOwnerFlags.NONE,
+                     p.bus_acquired, None, lambda c, n: (log('lost', n), loop.quit()))
+    try:
+        from gi.repository import GLibUnix
+        add = GLibUnix.signal_add
+    except ImportError:
+        add = GLib.unix_signal_add
+    for sig in (2, 15):
+        add(GLib.PRIORITY_HIGH, sig, lambda: (loop.quit(), False)[1])
+    try:
+        loop.run()
+    finally:
+        p.stop_all()
+
+
+if __name__ == '__main__':
+    main()

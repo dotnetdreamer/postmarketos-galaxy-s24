@@ -1,0 +1,496 @@
+#!/usr/bin/python3
+# Galaxy S24 postmarketOS (Claude, 2026-11-15): what Android does when the screen goes dark.
+#  1. Touch: the touch chip (STM, Samsung's sec_input driver) is told the display state through
+#     /sys/class/sec/tsp/enabled, as Android's framework does ("1,0" = display off, early; "2,1" =
+#     display on, late). With double-tap wake on (/sys/class/sec/tsp/cmd "aot_enable,1") the chip
+#     then sleeps in a low-power mode that only looks for a double tap, sends KEY_WAKEUP and can wake
+#     the phone from deep sleep. With it off the chip powers down. Phosh lights the screen on
+#     KEY_WAKEUP; KWin (Plasma Mobile) ignores it on purpose (its dpmsinputeventfilter.cpp takes it
+#     for the ACPI resume key), so under KWin a double tap is answered with a power key press, which
+#     KWin's screen-off filter turns into "screen on" and swallows.
+#     Pocket check: after a double tap the proximity sensor is read (through s24-sensord); if it is
+#     covered, the screen is switched off again (a power key press), as Samsung does.
+#  2. Sleep: a few seconds after the screen goes dark the phone suspends to RAM ("deep"), unless
+#     something needs it awake: a logind "sleep" block inhibitor (pmOS's sleep-inhibitor holds one
+#     while an SSH session is open or apk runs), sound playing (also over Bluetooth), a userspace
+#     wake lock, programs
+#     working (more than a quarter of a core of user CPU, or more than 20 KB/s of network traffic,
+#     over the last few seconds: a build or a download goes on with the screen dark), or a kernel
+#     wakeup source (the USB stack holds one while a computer's data cable is plugged in). It uses
+#     the kernel's wakeup_count handshake, so it never sleeps through a wakeup in progress. The power
+#     key, a double tap, the RTC alarm, Wi-Fi traffic for the phone and the charger cable wake it;
+#     after a wake that doesn't light the screen it sleeps again after a short grace period.
+# The screen state comes from the display driver: DSI-1's "enabled" file (phoc switches the output
+# off) and, while that says enabled, the DSI-1 connector's "state: on/off" line in
+# /sys/kernel/debug/dri/<exynos>/state (KWin only blanks it; /sys/class/drm/*/dpms never changes on
+# this driver), so it works whatever compositor darkens the panel. Settings: /etc/s24-power.conf.
+import os, sys, time, glob, struct, subprocess
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib
+
+CONF = '/etc/s24-power.conf'
+TSP = '/sys/class/sec/tsp'
+KEY_POWER, KEY_WAKEUP = 116, 143
+EV_KEY = 1
+EVSIZE = 24  # struct input_event on aarch64: timeval (16) + u16 type + u16 code + s32 value
+
+
+def log(*a):
+    print(time.strftime('%m-%d %H:%M:%S'), *a, file=sys.stderr, flush=True)
+
+
+def wsys(path, val):
+    try:
+        fd = os.open(path, os.O_WRONLY)
+        try:
+            os.write(fd, val.encode())
+        finally:
+            os.close(fd)
+        return True
+    except OSError as e:
+        log('write', path, repr(val), e)
+        return False
+
+
+def rsys(path, default=''):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_conf():
+    c = {'double_tap_wake': 1, 'pocket_check': 1, 'autosleep': 1, 'sleep_delay': 5, 'wake_grace': 3}
+    try:
+        with open(CONF) as f:
+            for line in f:
+                line = line.split('#')[0].strip()
+                if '=' in line:
+                    k, v = line.split('=', 1)
+                    c[k.strip()] = int(v.strip())
+    except (OSError, ValueError) as e:
+        log('config:', e)
+    return c
+
+
+def find_input(name):
+    for d in glob.glob('/sys/class/input/event*'):
+        if rsys(d + '/device/name') == name:
+            return '/dev/input/' + os.path.basename(d)
+    return None
+
+
+def kwin_running():
+    for comm in glob.glob('/proc/[0-9]*/comm'):
+        try:
+            with open(comm) as f:
+                if f.read().strip() == 'kwin_wayland':
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def dsi_enabled_file():
+    f = glob.glob('/sys/class/drm/card*-DSI-1/enabled')
+    return f[0] if f else None
+
+
+def drm_state_file():
+    for d in glob.glob('/sys/kernel/debug/dri/*'):
+        if 'exynos' in rsys(d + '/name'):
+            return d + '/state'
+    return None
+
+
+def panel_lit(path, conn=None):
+    """True/False from the DSI-1 connector block, None if unreadable."""
+    # cheap first: a compositor that switches the output off (phoc) unlinks the connector; one that
+    # only blanks it (KWin's DPMS) keeps it "enabled", so then ask the driver's state dump
+    if conn and rsys(conn) == 'disabled':
+        return False
+    try:
+        with open(path) as f:
+            lines = f.read().split('\n')
+    except OSError:
+        return None
+    inside, crtc, state = False, None, None
+    for ln in lines:
+        if not ln.startswith((' ', '\t')):
+            inside = ln.startswith('connector[') and ln.endswith(': DSI-1')
+            continue
+        if inside:
+            s = ln.strip()
+            if s.startswith('crtc='):
+                crtc = s[5:]
+            elif s.startswith('state:'):
+                state = s[6:].strip()
+    if state is not None:
+        return state != 'off'
+    if crtc is not None:
+        return crtc != '(null)'
+    return None
+
+
+def user_jiffies():
+    with open('/proc/stat') as f:
+        p = f.readline().split()
+    return int(p[1]) + int(p[2])   # user + nice
+
+
+def net_bytes():
+    total = 0
+    with open('/proc/net/dev') as f:
+        for ln in f.readlines()[2:]:
+            name, rest = ln.split(':', 1)
+            if name.strip() != 'lo':
+                v = rest.split()
+                total += int(v[0]) + int(v[8])
+    return total
+
+
+def irq_name(n):
+    try:
+        with open('/proc/interrupts') as f:
+            for ln in f:
+                p = ln.split()
+                if p and p[0] == n + ':':
+                    return ' '.join(x for x in p[1:] if not x.isdigit())
+    except OSError:
+        pass
+    return '?'
+
+
+class Power:
+    def __init__(self):
+        self.conf = read_conf()
+        self.drm = drm_state_file()
+        self.conn = dsi_enabled_file()
+        self.screen = None          # last seen panel state
+        self.touch_on = None        # what we last told the touch chip
+        self.woken_by_key = 0.0     # monotonic time of the last power/double-tap key while dark
+        self.injected = 0.0         # monotonic time of our own power key press (_press_power)
+        self.kwin = kwin_running()  # looked up again each time the screen goes dark
+        self.next_try = 0.0         # earliest monotonic time for the next sleep attempt
+        self.backoff = 2.0
+        self.counter = None         # the "cat wakeup_count" child while it waits
+        self.counter_watch = None
+        self.touch_fd = self.touch_watch = None
+        self.last_inhibit = None
+        self.sysbus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        self.kmsg = None
+        try:
+            self.kmsg = os.open('/dev/kmsg', os.O_RDONLY | os.O_NONBLOCK)
+            os.lseek(self.kmsg, 0, os.SEEK_END)
+        except OSError as e:
+            log('kmsg:', e)
+        self.stats = {'sleeps': 0, 'slept': 0.0}
+        self.tick_id = 0
+        self.hz = os.sysconf('SC_CLK_TCK')
+        self.mark = (time.monotonic(), user_jiffies(), net_bytes())
+        self.user_cores = self.net_rate = 0.0
+        self.keys = []
+        for name in ('s2mps27-power-keys',):
+            dev = find_input(name)
+            if dev:
+                fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+                GLib.io_add_watch(fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN, self._key_event)
+                self.keys.append(fd)
+        if os.path.exists(TSP + '/cmd'):
+            wsys(TSP + '/cmd', 'aot_enable,%d' % (1 if self.conf['double_tap_wake'] else 0))
+        log('started: double_tap_wake=%(double_tap_wake)d pocket_check=%(pocket_check)d autosleep=%(autosleep)d '
+            'sleep_delay=%(sleep_delay)ds wake_grace=%(wake_grace)ds' % self.conf, 'drm=%s' % self.drm)
+        self._tick()
+
+    # --- touch chip --------------------------------------------------------------------------
+    def set_touch(self, on):
+        if on == self.touch_on or not os.path.exists(TSP + '/enabled'):
+            return
+        # Samsung's DISPLAY_STATE_ON(2)/EVENT_LATE(1) and DISPLAY_STATE_OFF(1)/EVENT_EARLY(0)
+        if wsys(TSP + '/enabled', '2,1' if on else '1,0'):
+            self.touch_on = on
+        if on:
+            self._close_touch()
+        else:
+            self._open_touch()
+
+    def _open_touch(self):
+        # while dark, listen to the touch device for its double-tap KEY_WAKEUP (cheap: no touches flow)
+        if self.touch_fd is None:
+            dev = find_input('sec_touchscreen')
+            if dev:
+                self.touch_fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+                self.touch_watch = GLib.io_add_watch(self.touch_fd, GLib.PRIORITY_DEFAULT, GLib.IO_IN,
+                                                     self._key_event)
+
+    def _close_touch(self):
+        if self.touch_fd is not None:
+            GLib.source_remove(self.touch_watch)
+            os.close(self.touch_fd)
+            self.touch_fd = self.touch_watch = None
+
+    def _key_event(self, fd, cond):
+        try:
+            data = os.read(fd, EVSIZE * 64)
+        except OSError:
+            return True
+        for i in range(0, len(data) - EVSIZE + 1, EVSIZE):
+            _, _, typ, code, val = struct.unpack('<qqHHi', data[i:i + EVSIZE])
+            if typ == EV_KEY and code == KEY_POWER and time.monotonic() - self.injected < 1:
+                continue   # our own press, not the user's
+            if typ == EV_KEY and val == 1 and code == KEY_POWER and self.screen:
+                # probably turning the screen off: look again soon instead of in 2 s
+                GLib.source_remove(self.tick_id)
+                self.tick_id = GLib.timeout_add(600, self._tick)
+            if typ == EV_KEY and val == 1 and code in (KEY_POWER, KEY_WAKEUP) and not self.screen:
+                log('double tap' if code == KEY_WAKEUP else 'power key')
+                self.woken_by_key = time.monotonic()
+                self._cancel_counter()
+                self.set_touch(True)   # ready before the screen lights
+                if code == KEY_WAKEUP and self.kwin and not (self.drm and panel_lit(self.drm, self.conn)):
+                    self._press_power()   # KWin won't light the screen for KEY_WAKEUP
+                if code == KEY_WAKEUP and self.conf['pocket_check']:
+                    self._pocket_claim()
+        return True
+
+    # --- pocket check ------------------------------------------------------------------------
+    def _proxy(self, method, args=None, rtype=None):
+        return self.sysbus.call_sync('net.hadess.SensorProxy', '/net/hadess/SensorProxy',
+                                     'net.hadess.SensorProxy' if not method.startswith('Get') else
+                                     'org.freedesktop.DBus.Properties', method, args,
+                                     GLib.VariantType(rtype) if rtype else None,
+                                     Gio.DBusCallFlags.NONE, 1000, None)
+
+    def _pocket_claim(self):
+        try:
+            self._proxy('ClaimProximity')
+        except GLib.Error as e:
+            log('pocket check:', e.message)
+            return
+        GLib.timeout_add(700, self._pocket_read)   # the hub's first proximity report takes ~0.4 s
+
+    def _pocket_read(self):
+        near = False
+        try:
+            near = self._proxy('Get', GLib.Variant('(ss)', ('net.hadess.SensorProxy', 'ProximityNear')),
+                               '(v)').unpack()[0]
+            self._proxy('ReleaseProximity')
+        except GLib.Error as e:
+            log('pocket check:', e.message)
+        if near and panel_lit(self.drm, self.conn):
+            log('double tap with the proximity sensor covered (pocket?): screen off again')
+            self._press_power()
+        return False
+
+    def _press_power(self):
+        dev = find_input('s2mps27-power-keys')
+        if not dev:
+            return
+        self.injected = time.monotonic()
+        fd = os.open(dev, os.O_WRONLY)
+        try:
+            for code, val in ((KEY_POWER, 1), (0, 0), (KEY_POWER, 0), (0, 0)):
+                os.write(fd, struct.pack('<qqHHi', 0, 0, EV_KEY if code else 0, code, val))
+                if code and val:
+                    time.sleep(0.05)
+        finally:
+            os.close(fd)
+
+    # --- main tick ---------------------------------------------------------------------------
+    def _tick(self):
+        lit = panel_lit(self.drm, self.conn) if self.drm else None
+        if lit is None:
+            lit = bool(self.screen)
+        now = time.monotonic()
+        t, j, b = self.mark
+        if now - t >= 3:   # how busy programs and the network were over the last ~3 s
+            j2, b2 = user_jiffies(), net_bytes()
+            self.user_cores = (j2 - j) / self.hz / (now - t)
+            self.net_rate = (b2 - b) / (now - t)
+            self.mark = (now, j2, b2)
+        if lit != self.screen:
+            self.screen = lit
+            log('screen', 'on' if lit else 'off')
+            if lit:
+                self._cancel_counter()
+                self.backoff = 2.0
+            else:
+                self.next_try = now + self.conf['sleep_delay']
+                self.kwin = kwin_running()
+        if lit:
+            self.woken_by_key = 0.0   # the key did its job
+            self.set_touch(True)
+        elif not (self.touch_on and now - self.woken_by_key < 3):
+            self.set_touch(False)
+            self._maybe_sleep(now)
+        # a key turns the screen on at once (_key_event); this catches the rest (idle blanking, a call
+        # lighting it) - slow on purpose: each wakeup of this Python process costs ~1-2 ms of CPU
+        self.tick_id = GLib.timeout_add(2000 if lit else 1000, self._tick)
+        return False
+
+    # --- sleep -------------------------------------------------------------------------------
+    def _inhibited(self):
+        try:
+            res = self.sysbus.call_sync('org.freedesktop.login1', '/org/freedesktop/login1',
+                                        'org.freedesktop.login1.Manager', 'ListInhibitors', None,
+                                        GLib.VariantType('(a(ssssuu))'), Gio.DBusCallFlags.NONE, 2000, None)
+            for what, who, why, mode, uid, pid in res.unpack()[0]:
+                if mode == 'block' and 'sleep' in what.split(':'):
+                    return '%s (%s)' % (who, why)
+        except GLib.Error as e:
+            log('logind:', e.message)
+        for st in glob.glob('/proc/asound/card*/pcm*/sub*/status'):
+            s = rsys(st)
+            if 'state: RUNNING' in s or 'state: DRAINING' in s:
+                return 'sound playing (%s)' % st.split('/')[3:5]
+        wl = rsys('/sys/power/wake_lock')
+        if wl:
+            return 'wake lock ' + wl
+        # Bluetooth audio isn't an ALSA stream here: while a Bluetooth link is up (the kernel adds
+        # /sys/class/bluetooth/hciN:HANDLE per connection), ask BlueZ for an active media transport
+        if glob.glob('/sys/class/bluetooth/hci*:*'):
+            try:
+                res = self.sysbus.call_sync('org.bluez', '/', 'org.freedesktop.DBus.ObjectManager',
+                                            'GetManagedObjects', None,
+                                            GLib.VariantType('(a{oa{sa{sv}}})'),
+                                            Gio.DBusCallFlags.NO_AUTO_START, 1000, None)
+                for path, ifaces in res.unpack()[0].items():
+                    t = ifaces.get('org.bluez.MediaTransport1')
+                    if t and t.get('State') == 'active':
+                        return 'Bluetooth audio playing'
+            except GLib.Error:
+                pass
+        if self.user_cores > 0.25:
+            return 'programs busy (%.2f cores)' % self.user_cores
+        if self.net_rate > 20000:
+            return 'network busy (%.0f KB/s)' % (self.net_rate / 1000)
+        return None
+
+    def _maybe_sleep(self, now):
+        if not self.conf['autosleep'] or self.counter is not None or now < self.next_try:
+            return
+        why = self._inhibited()
+        if why:
+            kind = why.split(' (')[0]
+            if kind != self.last_inhibit:
+                log('stays awake:', why)
+                self.last_inhibit = kind
+            self.next_try = now + 5
+            return
+        if self.last_inhibit:
+            log('nothing holds it awake any more')
+            self.last_inhibit = None
+        # blocks while a kernel wakeup source is active (USB data cable, a wakeup being handled)
+        self.counter = subprocess.Popen(['cat', '/sys/power/wakeup_count'], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL)
+        self.counter_watch = GLib.io_add_watch(self.counter.stdout.fileno(), GLib.PRIORITY_DEFAULT,
+                                               GLib.IO_IN | GLib.IO_HUP, self._counted)
+
+    def _cancel_counter(self):
+        if self.counter is not None:
+            GLib.source_remove(self.counter_watch)
+            self.counter.kill()
+            self.counter.wait()
+            self.counter.stdout.close()
+            self.counter = self.counter_watch = None
+
+    def _counted(self, fd, cond):
+        p, self.counter, self.counter_watch = self.counter, None, None
+        out = p.stdout.read().strip()
+        p.wait()
+        p.stdout.close()
+        # the screen may have lit since the last tick (a call, a notification): look again
+        if self.screen or panel_lit(self.drm, self.conn) or not out.isdigit() or self._inhibited():
+            self.next_try = time.monotonic() + 1
+            return False
+        # a wakeup counted since the read makes this write fail: then don't sleep yet
+        if not wsys('/sys/power/wakeup_count', out.decode()):
+            self.next_try = time.monotonic() + 1
+            return False
+        self._suspend()
+        return False
+
+    def _suspend(self):
+        b0 = time.clock_gettime(time.CLOCK_BOOTTIME)
+        try:
+            fd = os.open('/sys/power/state', os.O_WRONLY)
+            try:
+                os.write(fd, b'mem')   # returns after the phone wakes
+            finally:
+                os.close(fd)
+        except OSError as e:
+            log('sleep refused:', e, '- retry in %ds' % self.backoff)
+            self.next_try = time.monotonic() + self.backoff
+            self.backoff = min(self.backoff * 2, 120)
+            return
+        slept = time.clock_gettime(time.CLOCK_BOOTTIME) - b0
+        irq = rsys('/sys/power/pm_wakeup_irq')
+        self.stats['sleeps'] += 1
+        self.stats['slept'] += slept
+        log('slept %.1fs, woken by irq %s (%s); total %d sleeps %.0fs'
+            % (slept, irq, irq_name(irq) if irq else '-', self.stats['sleeps'], self.stats['slept']))
+        self.backoff = 2.0
+        self.next_try = time.monotonic() + self.conf['wake_grace']
+        GLib.timeout_add(3000, self._usb_check)
+
+    def _usb_check(self):
+        # A sleep while a computer's USB data link was up (not by us: the wakeup handshake prevents
+        # it, but logind's suspend has none) leaves the controller dead ("DWC3 controller soft reset
+        # failed"); Samsung's USB data off/on switch plus re-attaching the gadget brings it back.
+        if self.kmsg is None:
+            return False
+        bad = False
+        while True:
+            try:
+                rec = os.read(self.kmsg, 8192)
+            except BlockingIOError:
+                break
+            except BrokenPipeError:   # overwritten records: skip ahead
+                continue
+            except OSError:
+                break
+            if b'soft reset failed' in rec:
+                bad = True
+        if not bad:
+            return False
+        log('USB controller failed after sleep: restarting it')
+        ctl = '/sys/class/usb_notify/usb_control/usb_data_enabled'
+        wsys(ctl, '0')
+        GLib.timeout_add(1500, self._usb_on)
+        return False
+
+    def _usb_on(self):
+        wsys('/sys/class/usb_notify/usb_control/usb_data_enabled', '1')
+        GLib.timeout_add(3000, self._usb_rebind)
+        return False
+
+    def _usb_rebind(self):
+        udcs = os.listdir('/sys/class/udc') if os.path.isdir('/sys/class/udc') else []
+        for g in glob.glob('/sys/kernel/config/usb_gadget/*/UDC'):
+            if not rsys(g) and udcs:
+                wsys(g, udcs[0])
+                log('USB gadget re-attached to', udcs[0])
+        return False
+
+
+def main():
+    loop = GLib.MainLoop()
+    p = Power()
+    try:
+        from gi.repository import GLibUnix
+        add = GLibUnix.signal_add
+    except ImportError:
+        add = GLib.unix_signal_add
+    for sig in (2, 15):
+        add(GLib.PRIORITY_HIGH, sig, lambda: (loop.quit(), False)[1])
+    try:
+        loop.run()
+    finally:
+        p._cancel_counter()
+        p.set_touch(True)   # leave the touch chip working
+
+
+if __name__ == '__main__':
+    main()

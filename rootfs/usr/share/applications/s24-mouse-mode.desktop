@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mouse Mode
+GenericName=Touchpad & zoom
+Comment=Use the touchscreen as a touchpad with a bigger desktop that follows the pointer
+Exec=/usr/local/bin/s24-mouse-mode toggle
+Icon=input-touchpad
+Terminal=false
+StartupNotify=false
+Categories=Utility;
+Keywords=mouse;touchpad;pointer;zoom;dex;

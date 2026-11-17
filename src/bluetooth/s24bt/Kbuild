@@ -1,0 +1,7 @@
+obj-m := s24bt.o
+s24bt-core := af_bluetooth hci_core hci_conn hci_event mgmt hci_sock hci_sysfs l2cap_core \
+	l2cap_sock smp lib ecdh_helper hci_request mgmt_util mgmt_config hci_codec eir hci_sync \
+	sco iso hci_debugfs
+s24bt-y := s24bt_main.o $(addprefix bt/,$(addsuffix .o,$(s24bt-core))) \
+	rfcomm/core.o rfcomm/sock.o rfcomm/tty.o uart/hci_ldisc.o uart/hci_h4.o uart/hci_qca.o uart/btqca.o
+ccflags-y := -include $(src)/s24bt_compat.h -I$(src)/bt
