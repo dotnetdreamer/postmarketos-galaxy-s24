@@ -1,0 +1,26 @@
+#!/bin/sh
+# USB-C monitors and docks on the Galaxy S24, run by OpenRC's "local" service at boot
+# (Claude, 2026-11-17).
+#
+# Video out. Samsung's usb_notify driver keeps USB-C DisplayPort (the "alternate mode") and the
+# USB host role switched off until Android reports the screen lock state through usb_sl:
+#   3 = not reported yet (the boot value), 0 = unlocked, 1 = locked, 2 = locked + USB restricted.
+# A kernel worker waits for any value other than 3 before it ends the boot delay and lets the
+# USB-C chip (MAX77775) ask the monitor for DisplayPort. postmarketOS never reports it, so a
+# monitor or dock only charged the phone. Report "unlocked": no lock-screen USB restriction,
+# which is what plain Linux does anyway. Monitors and docks plugged in later then just work.
+#
+# Wired network. The USB Ethernet drivers are Google's GKI modules from the system_dlkm image
+# (copied to /usr/lib/modules/system_dlkm). Nothing loads them by itself on this system (there
+# is no /lib/modules/<kernel version> with a modules.alias), so load the common ones: Realtek
+# RTL8152/8153 (most docks and dongles), ASIX AX88179/AX88772, and the generic CDC ECM/NCM
+# class drivers. NetworkManager then connects a cable on its own.
+
+sl=/sys/class/usb_notify/usb_control/usb_sl
+[ -w "$sl" ] && echo 0 > "$sl"
+
+M=/usr/lib/modules/system_dlkm
+for m in mii usbnet cdc_ether cdc_ncm r8152 ax88179_178a asix; do
+	grep -q "^$m " /proc/modules || insmod "$M/$m.ko" 2>/dev/null
+done
+exit 0

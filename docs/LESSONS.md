@@ -54,6 +54,8 @@ Everything here was learned the hard way on this phone (Galaxy S24 SM-S921B, ker
 - Windows binds its ADB driver to Google's `18d1:d001` gadget IDs; `1d6b:0104` with an IAD gets NCM + serial
 - Every real modem power change (on to off or back) makes the PC reset the phone's USB link: TCP over the cable drops once. Run such commands detached and reconnect
 - A suspend while USB data is up leaves dwc3 dead; with the cable in, `usb_notify` and `dwc3-otg` hold wakeup sources, so a correct wakeup-count handshake simply doesn't sleep (like Android)
+- **A USB-C monitor only charged the phone until something reported the screen lock state.** Samsung's `usb_notify` ends its USB boot delay only after Android writes the lock state to `/sys/class/usb_notify/usb_control/usb_sl` (boot value `3`, "not reported"). Until then DisplayPort alternate mode stays stopped and the USB host role stays off. Write `0` (unlocked) at boot. `/proc/usblog` (Samsung's USB event history, survives the kernel log filling up) shows the whole chain: look for `alternate mode is` and `alt_is_support` (15 = all four parts ready)
+- Writing `boot_completed` to the battery driver does not end that boot delay, despite the name
 
 ## Sound
 

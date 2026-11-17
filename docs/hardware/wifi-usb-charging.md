@@ -15,6 +15,7 @@
 - `rootfs/etc/NetworkManager/conf.d/50-s24-usb0.conf` keeps NetworkManager away from `usb0`
 - The serial function is a second rescue path when the network doesn't come up (`pc-tools/s24acm.py` talks to it straight over libusb)
 - A modem power change resets the USB link once (TCP over the cable drops)
+- Monitors, docks and USB devices on the phone (USB host mode): see [usb-c-display.md](usb-c-display.md)
 
 ## Charging
 

@@ -15,3 +15,4 @@ The scripts used while porting, kept because they show how each part was checked
 | `modem/` | Data, DNS64, Wi-Fi-off fallback, NetworkManager toggles, an SMS draft that is never sent |
 | `mousemode/` | Mouse mode daemon and session tests against a stand-in touchscreen |
 | `gpu/` | Vulkan and GPU app checks in a headless compositor |
+| `usb-c/` | USB-C, monitor and dock state, read only (`usbc-state.sh`) |

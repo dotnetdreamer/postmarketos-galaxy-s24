@@ -54,7 +54,7 @@ Samsung's modem and camera have no Linux drivers that Linux apps can use: everyt
 | `s24-greeter-reaper` | shell | Cleans up the login screen's leftover processes after each login |
 | `s24-podman-api`, `s24-podman-nat` | shell | Podman's API socket for Podman Desktop, NAT for containers |
 
-Boot-time fixes run from `/etc/local.d/` (`s24-perf.start`: CPU governor tuning, `s24-audio.start`: mixer routes, `s24-glibc-cache.start`).
+Boot-time fixes run from `/etc/local.d/` (`s24-perf.start`: CPU governor tuning, `s24-audio.start`: mixer routes, `s24-glibc-cache.start`, `s24-usbc.start`: USB-C monitors and docks, see [hardware/usb-c-display.md](hardware/usb-c-display.md)).
 
 ## Graphics
 
