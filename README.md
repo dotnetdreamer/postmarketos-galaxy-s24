@@ -27,8 +27,9 @@ This repository has everything that made it work: the boot ramdisk, the postmark
 | Desktop apps | Works | VS Code, Chromium, Brave, Firefox, Podman Desktop; wide apps are scaled to fit the phone |
 | Mouse mode | Works | Turns the screen into a touchpad and zooms out, for big desktop apps |
 | Containers | Works | Podman (rootful only: the kernel has no user namespaces) |
+| Vibration | Works | A small bridge makes the Cirrus motor look like a device feedbackd can drive |
 | Fingerprint, NFC, GPS, video decoding hardware, NPU | Not done | |
-| Vibration, USB-C video out | Not tried | |
+| USB-C video out | Not tried | |
 
 ## What you need
 

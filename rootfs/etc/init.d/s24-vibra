@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+# Galaxy S24 postmarketOS (Claude, 2026-11-17): the vibration bridge for feedbackd.
+# feedbackd only drives a force-feedback device that advertises FF_RUMBLE; the S24's cs40l26 motor
+# offers FF_PERIODIC. s24-vibrad exposes a virtual "s24-vibra" device with FF_RUMBLE and forwards
+# every effect to the real motor as periodic. A udev rule (90-s24-vibrator.rules) tags the virtual
+# device as feedbackd's vibra device; the user is in the input group so feedbackd can open it.
+description="Galaxy S24 vibration bridge (feedbackd <-> cs40l26)"
+command=/usr/local/sbin/s24-vibrad
+supervisor=supervise-daemon
+output_log=/var/log/s24-vibra.log
+error_log=/var/log/s24-vibra.log
+respawn_delay=5
+
+start_pre() {
+	modprobe uinput 2>/dev/null || true   # /dev/uinput; harmless if built in
+	return 0
+}

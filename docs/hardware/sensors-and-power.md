@@ -42,3 +42,25 @@ Rules learned:
 - `pm_test` levels `processors` and `core` crash this phone
 
 Tests: `tests/sensors/sleeptest.sh` (switches USB data off to mimic a battery-only phone, counts sleeps, wakes by RTC alarm, brings USB back), `suspendtest.sh`, `taptest.py`.
+
+## Vibration
+
+**State:** works. Notifications and the keyboard buzz through feedbackd (the postmarketOS haptics service).
+
+The motor is a Cirrus Logic **cs40l26**, exposed as the input device `sec_vibrator_inputff`. It supports the `FF_PERIODIC` force-feedback effect (and `FF_CUSTOM`, `FF_GAIN`), but **not** `FF_RUMBLE`. feedbackd only binds a device that advertises `FF_RUMBLE`, so it rejects the motor directly ("No rumble capable vibra device").
+
+`src/vibration/s24-vibrad.c` bridges the two:
+
+```
+feedbackd --FF_RUMBLE--> virtual "s24-vibra" device (uinput) --s24-vibrad--> cs40l26 as FF_PERIODIC
+```
+
+It creates a virtual input device that advertises `FF_RUMBLE`, which feedbackd happily binds, and translates every effect feedbackd uploads into a periodic (sine) effect on the real motor, passing the gain through.
+
+Setup:
+
+- `rootfs/etc/udev/rules.d/90-s24-vibrator.rules` tags the **virtual** device (not the real motor) as feedbackd's vibra device
+- The user must be in the `input` group (this `/dev` has no ACLs, so `uaccess` does nothing; the group is the way in). It takes effect at the next login
+- `rootfs/etc/init.d/s24-vibra` runs the bridge at boot (it loads `uinput` first)
+
+Test it with `fbcli -E message-new-instant` (a notification buzz) in the session, or drive the motor directly with a periodic effect as root (there is no `FF_RUMBLE`: a rumble upload returns `EINVAL`).

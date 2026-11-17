@@ -57,6 +57,9 @@ if want bt; then
 	b s24-bt /usr/local/sbin/s24-bt gcc -O2 -Wall -o "$T/s24-bt" "$SRC/bluetooth/s24-bt.c"
 	echo "note: the s24bt.ko kernel module is built in a kernel tree, see docs/hardware/bluetooth.md"
 fi
+if want vibration; then
+	b s24-vibrad /usr/local/sbin/s24-vibrad gcc -O2 -Wall -o "$T/s24-vibrad" "$SRC/vibration/s24-vibrad.c"
+fi
 if want gpu; then
 	b libs24fbfix.so /usr/local/lib/libs24fbfix.so gcc -O2 -shared -fPIC -I/usr/include/libdrm \
 		-o "$T/libs24fbfix.so" "$SRC/gpu/s24fbfix.c" -ldl

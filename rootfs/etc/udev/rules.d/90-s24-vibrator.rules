@@ -1,0 +1,5 @@
+# Galaxy S24: s24-vibrad exposes a virtual "s24-vibra" device that advertises FF_RUMBLE (which
+# feedbackd requires) and forwards to the real cs40l26 motor as FF_PERIODIC. feedbackd binds the
+# virtual device. This /dev has no ACLs, so access is by group: the node is root:input and the
+# user is in the input group.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="s24-vibra", ENV{FEEDBACKD_TYPE}="vibra", TAG+="uaccess"
