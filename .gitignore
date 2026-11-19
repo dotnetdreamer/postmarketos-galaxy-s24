@@ -12,3 +12,5 @@ __pycache__/
 backup/
 logs/
 bt_addr
+# cargo build output
+src/remote/target/

@@ -15,4 +15,5 @@ The scripts used while porting, kept because they show how each part was checked
 | `modem/` | Data, DNS64, Wi-Fi-off fallback, NetworkManager toggles, an SMS draft that is never sent |
 | `mousemode/` | Mouse mode daemon and session tests against a stand-in touchscreen |
 | `gpu/` | Vulkan and GPU app checks in a headless compositor |
+| `remote/` | Remote Desktop: a private nested Plasma Mobile session on the phone, a headless browser driven over CDP through the real tunnel, read-only looks at the real session, the tile's QML under `qmlscene` |
 | `usb-c/` | USB-C, monitor and dock state, read only (`usbc-state.sh`); docked mode and monitor sound rules against stand-in settings and a stand-in `pactl` (`dockd-logic-test.py`) |

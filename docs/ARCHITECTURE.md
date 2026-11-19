@@ -51,6 +51,7 @@ Samsung's modem and camera have no Linux drivers that Linux apps can use: everyt
 | `s24-power` | `s24-powerd` (Python) | Screen-off handling, double tap to wake, deep sleep with the kernel's wakeup handshake |
 | `s24-vibra` | `s24-vibrad` (C) | Vibration: a virtual force-feedback device that feedbackd can drive, forwarded to the real motor (see [hardware/sensors-and-power.md](hardware/sensors-and-power.md)) |
 | `s24-mouse-mode` | `s24-mouse-moded` (C) | Touchscreen to touchpad for mouse mode |
+| (quick setting, on demand) | `s24-remote` (Rust) | Remote Desktop: the desktop in a browser anywhere, through a Cloudflare tunnel, with Open Android DeX's `openandroiddex-pmos` making the screen; see [remote-desktop.md](remote-desktop.md) |
 | (session autostart) | `s24-dockd` (Python) | Docked mode (movable windows) while a monitor is on the USB-C port, see [hardware/usb-c-display.md](hardware/usb-c-display.md) |
 | `s24-greeter-reaper` | shell | Cleans up the login screen's leftover processes after each login |
 | `s24-podman-api`, `s24-podman-nat` | shell | Podman's API socket for Podman Desktop, NAT for containers |

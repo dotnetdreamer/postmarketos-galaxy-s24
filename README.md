@@ -28,6 +28,7 @@ This repository has everything that made it work: the boot ramdisk, the postmark
 | Mouse mode | Works | Turns the screen into a touchpad and zooms out, for big desktop apps |
 | Containers | Works | Podman (rootful only: the kernel has no user namespaces) |
 | Vibration | Works | A small bridge makes the Cirrus motor look like a device feedbackd can drive |
+| Remote Desktop | Works | The phone's desktop in any browser, from anywhere (mobile data too), nothing installed on the computer: a quick setting, a Cloudflare tunnel, a one-time code, H.264 to the browser's WebCodecs, Low/Medium/High. See [docs/remote-desktop.md](docs/remote-desktop.md) |
 | USB-C monitors and docks | Works | The desktop on the monitor as a second screen with movable windows (docked mode turns on by itself), sound on the monitor's speakers, charging at the same time, and the dock's USB ports (keyboard, mouse, wired network). Tested with a Dell WD19DCS dock at 2560x1440 |
 | Fingerprint, NFC, GPS, video decoding hardware, NPU | Not done | |
 

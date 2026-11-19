@@ -1,0 +1,15 @@
+{
+    "KPackageStructure": "KPackage/GenericQML",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "Claude"
+            }
+        ],
+        "Description": "Use this phone's desktop from any browser, from anywhere",
+        "Icon": "krfb",
+        "Id": "org.s24.quicksetting.remote",
+        "License": "MIT",
+        "Name": "Remote Desktop"
+    }
+}

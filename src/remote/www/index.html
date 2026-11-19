@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="dark light">
+<title>Phone Desktop</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+
+<main id="signin" class="card-page" hidden>
+  <form id="signin-form" class="card" autocomplete="off">
+    <img src="icon.svg" alt="" class="mark" width="48" height="48">
+    <h1>Your phone's desktop</h1>
+    <p class="lead">Type the code from the <b>Remote Desktop</b> notification on your phone.</p>
+    <label for="code" class="sr">Code</label>
+    <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="9"
+           placeholder="1234 5678" pattern="[0-9 ]*" required>
+    <button id="signin-go" type="submit">Connect</button>
+    <p id="signin-msg" class="msg" role="alert"></p>
+  </form>
+</main>
+
+<main id="nope" class="card-page" hidden>
+  <div class="card">
+    <img src="icon.svg" alt="" class="mark" width="48" height="48">
+    <h1>This browser can't show the desktop</h1>
+    <p class="lead" id="nope-why">It needs a browser that can decode video for web pages (WebCodecs):
+      a recent Chrome, Edge, Firefox, Safari or Opera.</p>
+  </div>
+</main>
+
+<div id="desk" hidden>
+  <canvas id="screen" tabindex="0" aria-label="The phone's desktop"></canvas>
+  <textarea id="typing" aria-label="Typing" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+
+  <div id="handle" title="Menu"><span></span></div>
+  <nav id="bar" aria-label="Remote desktop">
+    <div class="seg" role="radiogroup" aria-label="Quality">
+      <button data-q="low" role="radio" title="Smoother on a slow connection, less sharp">Low</button>
+      <button data-q="medium" role="radio" title="The balance (default)">Medium</button>
+      <button data-q="high" role="radio" title="Sharpest, needs a fast connection">High</button>
+    </div>
+    <button id="b-full" title="Full screen (keys like Esc and Alt+Tab go to the phone)">Full screen</button>
+    <button id="b-keys" title="Show a keyboard (touch screens)">Keyboard</button>
+    <button id="b-clip" aria-pressed="false" title="Share the clipboard with the phone">Clipboard</button>
+    <button id="b-phone" aria-pressed="false" title="The phone's own screen while you're connected">Phone screen</button>
+    <button id="b-stats" aria-pressed="false" title="Speed and delay">Info</button>
+    <button id="b-bye" title="Disconnect">Disconnect</button>
+  </nav>
+
+  <div id="stats" hidden></div>
+  <div id="banner" hidden></div>
+  <div id="cover">
+    <div class="spinner" aria-hidden="true"></div>
+    <p id="cover-msg">Connecting…</p>
+    <button id="cover-retry" hidden>Connect again</button>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Remote Desktop
+Comment=This phone's desktop in any browser
+Icon=krfb
+Exec=/usr/local/bin/s24-remote show
+NoDisplay=true

@@ -1,0 +1,26 @@
+[package]
+name = "s24-remote"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "The phone's desktop in any browser, from anywhere: a tunnel, a door with a code, and the picture"
+publish = false
+
+[dependencies]
+tokio = { version = "1.54", features = ["rt", "net", "io-util", "process", "time", "sync", "macros", "signal"] }
+hyper = { version = "1.12", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+bytes = "1.12"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+serde_json = "1.0.154"
+libc = "0.2.191"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

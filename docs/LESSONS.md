@@ -114,6 +114,22 @@ The long version is in [hardware/camera.md](hardware/camera.md). The short one:
 - Saying Yes to "IBus Preferences" makes KWin use IBus as its input method and hides Plasma's keyboard
 - Samsung's touchpad device and the sensor hub's `meta_event` device show up as pointers in KWin: disable them through KWin's D-Bus input devices
 
+## Remote Desktop
+
+The long version is in [remote-desktop.md](remote-desktop.md). The short one:
+
+- KWin has **one screen-off state for all screens** (Workspace::requestDpmsState): a virtual screen goes dark with the phone's panel, and the first key or pointer move from either side lights both. Its input filter swallows that first event. To keep the phone dark while a browser uses the desktop, switch the panel off as a screen (`kscreen-doctor output.DSI-1.disable`), not with DPMS
+- A newly added or re-enabled screen turns every screen on: the panel lights for a moment whenever it comes back
+- KWin keeps screen settings **per set of screens** (`kwinoutputconfig.json`): a panel switched off beside a virtual screen comes back by itself when that screen goes, and goes off by itself when it comes again. Code that switches it must expect to find it off already
+- A touch on a switched-off panel lands at (0, 0) of KWin's space (`devicePointToGlobalPosition` finds no screen): hold the touchscreen with `EVIOCGRAB`. Don't disable it through KWin's D-Bus `InputDevice.enabled`: KWin saves that in `kcminputrc`, and a crash would leave a phone with a dead touchscreen after a restart
+- logind lets a program block sleep (`Inhibit("sleep", …, "block")`) only from the desktop session itself: from SSH it is `AccessDenied`. elogind tells sessions apart by cgroup (`/sys/fs/cgroup/c3`); a test that must start something as the session would has to join it first
+- Plasma's "turn off the screen when locked" ignores idle inhibitions: an idle lock screen goes dark after about a minute, and a pointer move wakes it
+- A new quick tunnel address isn't known for its first seconds. Ask the phone's usual DNS (often the home router, which the computer asks too) that early and "no such name" can stay in its cache for minutes: try it over DNS-over-HTTPS
+- Plasma Mobile loads quick settings once, when plasmashell starts, and adds unknown ones to the end of the drawer by itself
+- The screen program's colour conversion with 4 threads cost more CPU than with 1 (99% against 88% of a core at 1600x900, 30 frames a second)
+- **Don't restart plasmashell while the session is locked.** `plasmashell --replace` makes the old instance crash on its way out (KCrash then starts it again), and Plasma Mobile's lock screen depends on the shell's `/Mobile` D-Bus object. On the test phone the lock screen process crashed four times around such a restart, and kscreenlocker's emergency mode followed: no PIN pad until `loginctl unlock-session` or a restart. kscreenlocker counts crashes from the last unlock, so crashes that it quietly recovered from add up
+- kscreenlocker's `Lock` on a session that is locked already sends SIGUSR1 to its lock screen process by pid; in emergency mode that process is gone, the pid is 0, and `kill(0, …)` signals KWin's whole process group. Check `GetActive` first
+
 ## Working on the phone
 
 - With the screen off and no cable, the phone suspends between your SSH commands: hold `/sys/power/wake_lock` inside every script
