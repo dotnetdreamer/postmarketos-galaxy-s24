@@ -155,19 +155,43 @@ fn key() -> Result<rcgen::KeyPair, String> {
     Ok(k)
 }
 
-/// A certificate for `names`: the kept one if it is for them and has a month left, else a new one.
+/// At most this many addresses in a certificate: the current ones first, then the latest kept ones.
+const MAX_CERT_IPS: usize = 8;
+
+/// The names a new certificate gets: the ones needed now, and the kept certificate's too (up to
+/// MAX_CERT_IPS addresses), so that going back to a network it knew doesn't need a new one.
+pub fn merged_names(now: &[String], kept: &[String]) -> Vec<String> {
+    let is_ip = |n: &String| n.parse::<IpAddr>().is_ok();
+    let mut out: Vec<String> = now.iter().filter(|n| !is_ip(n)).cloned().collect();
+    let mut ips = 0;
+    for n in now.iter().chain(kept.iter()).filter(|n| is_ip(n)) {
+        if ips < MAX_CERT_IPS && !out.contains(n) {
+            out.push(n.clone());
+            ips += 1;
+        }
+    }
+    out
+}
+
+/// A certificate for `names`: the kept one if it names all of them and has a month left, else a new
+/// one for them and the kept one's names. A browser's "continue" holds as long as the certificate
+/// does: at boot the phone's Wi-Fi comes up after Remote Desktop starts, and the certificate must
+/// not change on the way.
 fn certificate(names: &[String]) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
     let key = key()?;
     let key_der = || PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der()));
     let now = time::OffsetDateTime::now_utc();
+    let mut kept: Vec<String> = vec![];
     if let (Ok(der), Ok(meta)) = (std::fs::read(cert_file()), std::fs::read_to_string(names_file())) {
         let mut lines = meta.lines();
-        let kept: Vec<String> = lines.next().unwrap_or("").split_whitespace().map(String::from).collect();
+        kept = lines.next().unwrap_or("").split_whitespace().map(String::from).collect();
         let until: i64 = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
-        if kept == names && until - now.unix_timestamp() > 30 * 86400 && !der.is_empty() {
+        let covered = names.iter().all(|n| kept.contains(n));
+        if covered && until - now.unix_timestamp() > 30 * 86400 && !der.is_empty() {
             return Ok((vec![CertificateDer::from(der)], key_der()));
         }
     }
+    let names = merged_names(names, &kept);
     let mut params = rcgen::CertificateParams::new(names.to_vec()).map_err(|e| format!("certificate names: {e}"))?;
     let mut dn = rcgen::DistinguishedName::new();
     let machine = machine_name();
@@ -344,6 +368,47 @@ mod tests {
         assert!(!admit(to_mobile, from("172.20.0.5:50000"), &lan), "to an address that isn't a local network's");
         assert!(!admit(from("[2001:db8::1]:7443"), from("[2001:db8::2]:50000"), &lan), "IPv6");
         assert!(admit(from("[::ffff:10.0.0.30]:7443"), from("[::ffff:10.0.0.20]:1"), &lan), "IPv4 as IPv6");
+    }
+
+    /// At boot Remote Desktop starts before the Wi-Fi is up: the certificate made when the Wi-Fi was
+    /// there must be kept (a new one would bring the browser's warning back), and a new network adds
+    /// to it. On real files, in a folder of its own.
+    #[test]
+    fn certificate_kept_through_a_boot() {
+        let dir = std::env::temp_dir().join(format!("s24-remote-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("XDG_DATA_HOME", &dir);
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let (first, _) = certificate(&v(&["galaxy-s24", "galaxy-s24.local", "10.0.0.30", "172.16.42.1"])).unwrap();
+        // the Wi-Fi not up yet: only the USB address
+        let (boot, _) = certificate(&v(&["galaxy-s24", "galaxy-s24.local", "172.16.42.1"])).unwrap();
+        assert_eq!(boot[0].as_ref(), first[0].as_ref(), "the same certificate while the Wi-Fi isn't up");
+        let (wifi, _) = certificate(&v(&["galaxy-s24", "galaxy-s24.local", "10.0.0.30", "172.16.42.1"])).unwrap();
+        assert_eq!(wifi[0].as_ref(), first[0].as_ref(), "and once it is");
+        // another network: a new certificate, for it and the old addresses
+        let (other, _) = certificate(&v(&["galaxy-s24", "galaxy-s24.local", "10.9.0.4"])).unwrap();
+        assert_ne!(other[0].as_ref(), first[0].as_ref());
+        let names = std::fs::read_to_string(names_file()).unwrap();
+        assert!(names.starts_with("galaxy-s24 galaxy-s24.local 10.9.0.4 10.0.0.30 172.16.42.1\n"), "{names}");
+        let (back, _) = certificate(&v(&["galaxy-s24", "galaxy-s24.local", "10.0.0.30"])).unwrap();
+        assert_eq!(back[0].as_ref(), other[0].as_ref(), "back home: no new one");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn certificate_names_kept() {
+        let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // Wi-Fi not up yet at boot: the kept names (with it) cover what is needed, so the kept
+        // certificate is used; a new network adds its address to the old ones
+        assert_eq!(
+            merged_names(&v(&["galaxy-s24", "galaxy-s24.local", "10.9.0.4"]), &v(&["galaxy-s24", "galaxy-s24.local", "10.0.0.30", "172.16.42.1"])),
+            v(&["galaxy-s24", "galaxy-s24.local", "10.9.0.4", "10.0.0.30", "172.16.42.1"])
+        );
+        // at most MAX_CERT_IPS addresses, the current ones first
+        let many: Vec<String> = (1..=12).map(|i| format!("10.0.{i}.1")).collect();
+        let m = merged_names(&v(&["10.9.9.9"]), &many);
+        assert_eq!(m.len(), MAX_CERT_IPS);
+        assert_eq!(m[0], "10.9.9.9");
     }
 
     #[test]
