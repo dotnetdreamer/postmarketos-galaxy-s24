@@ -224,6 +224,9 @@ function connect() {
   ws.onopen = () => {
     s.retries = 0;
     send({ t: 'hello', v: 1, w: innerWidth, h: innerHeight, dpr: devicePixelRatio, quality: s.quality, phoneScreen: s.phoneScreen });
+    // A page hidden from its start (opened behind something: a browser's first-run screen did it)
+    // never sees the change to hidden, so it says so now.
+    if (document.hidden) send({ t: 'pause' });
     if (s.clip) send({ t: 'clipshare', on: true });
     s.timers.push(setInterval(() => send({ t: 'ping', n: performance.now() }), 2000));
     s.timers.push(setInterval(renderStats, 1000));
@@ -512,6 +515,7 @@ document.addEventListener('visibilitychange', () => {
     s.needKey = true;
     send({ t: 'resume' });
     syncClipboard();
+    if (!s.rtc) scheduleRtc(300);
   }
 });
 
@@ -537,7 +541,7 @@ function h264Codecs() {
 // WebRTC only where the page can say which frame it showed (requestVideoFrameCallback's RTP
 // timestamp): the phone paces itself by that. Elsewhere the WebSocket, which always can.
 function rtcPossible() {
-  return s.rtcOn && !!s.rtcConf && !s.rtcNoAcks && typeof RTCPeerConnection === 'function' &&
+  return s.rtcOn && !!s.rtcConf && !s.rtcNoAcks && !document.hidden && typeof RTCPeerConnection === 'function' &&
     'requestVideoFrameCallback' in HTMLVideoElement.prototype &&
     !!s.ws && s.ws.readyState === WebSocket.OPEN && !s.rtc && h264Codecs().length > 0;
 }
@@ -575,13 +579,18 @@ async function startRtc() {
     try { e.receiver.jitterBufferTarget = 0; } catch { /* older browser */ }
     try { e.receiver.playoutDelayHint = 0; } catch { /* older browser */ }
     video.srcObject = new MediaStream([e.track]);
-    video.play().catch(() => {});
-    // On top as soon as it has a picture: a video under the canvas isn't drawn, and an undrawn
-    // video never calls requestVideoFrameCallback (seen in Edge), which is where the
-    // acknowledgements come from.
-    const ready = () => { if (s.rtc === r && !r.live && video.readyState >= 2 && video.videoWidth) goLive(r); };
-    video.addEventListener('loadeddata', ready, { once: true });
-    video.addEventListener('playing', ready, { once: true });
+    video.play().catch((err) => {
+      // A browser that won't play a video by itself: the WebSocket, for good on this page.
+      if (s.rtc !== r) return;
+      s.rtcNoAcks = true;
+      rtcStop(r, 'the video would not play (' + ((err && err.name) || 'refused') + ')', true);
+    });
+    // On top once it plays: a video under the canvas isn't drawn, and an undrawn video never calls
+    // requestVideoFrameCallback (seen in Edge). The phone hears "live" only when a frame has been
+    // shown and named (goLive); until then the WebSocket's picture goes on under it.
+    r.playing = () => { if (s.rtc === r && !video.paused && video.videoWidth) showVideo(r); };
+    video.addEventListener('playing', r.playing);
+    video.addEventListener('resize', r.playing);
     watchFrames(r);
   };
   pc.onconnectionstatechange = () => {
@@ -633,13 +642,28 @@ function sizeFromVideo() {
 
 video.addEventListener('resize', () => { if (s.rtc && s.rtc.live) sizeFromVideo(); });
 
+// The video over the canvas (still both routes: the phone hasn't been told). A frame shown and
+// named within 3 s, or this browser can't do it here: then the WebSocket, for good on this page
+// (unless the page was hidden meanwhile, which shows nothing either).
+function showVideo(r) {
+  if (r.shown) return;
+  r.shown = true;
+  sizeFromVideo();
+  video.classList.add('live');
+  r.cbTimer = setTimeout(() => {
+    if (s.rtc !== r || r.live) return;
+    if (!document.hidden) s.rtcNoAcks = true;
+    rtcStop(r, 'no frame shown and named in 3 s', true);
+  }, 3000);
+}
+
 function goLive(r) {
   r.live = true;
   r.liveAt = performance.now();
   clearTimeout(r.timer);
+  clearTimeout(r.cbTimer);
   s.rtcTries = 0;
-  sizeFromVideo();
-  video.classList.add('live');
+  showVideo(r);
   send({ t: 'rtc-live' });
   if (!s.drawn) {
     s.drawn = true;
@@ -651,6 +675,11 @@ function rtcStop(r, why, tell) {
   if (!r || s.rtc !== r) return;
   s.rtc = null;
   clearTimeout(r.timer);
+  clearTimeout(r.cbTimer);
+  if (r.playing) {
+    video.removeEventListener('playing', r.playing);
+    video.removeEventListener('resize', r.playing);
+  }
   if (r.live) {
     // The last picture stays on the canvas until the WebSocket's key frame.
     try {
