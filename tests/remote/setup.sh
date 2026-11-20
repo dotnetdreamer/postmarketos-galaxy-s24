@@ -3,14 +3,17 @@
 # a probe receiver) and s24-remote serving it through a real quick tunnel.
 set -u
 . /tmp/s24rt/t.sh
-mkdir -p $T/config $T/data $T/cache $T/xdg
+mkdir -p $T/config $T/data $T/cache $T/xdg $R
+ln -sf /run/user/10000/pipewire-0 $R/pipewire-0
+ln -sf /run/user/10000/s24rt-0 $R/s24rt-0
 rm -rf $T/config/plasma-mobile; cp -r /home/user/.config/plasma-mobile $T/config/
 printf '[General]\nconvergenceModeEnabled=false\n\n[InitialStart]\nwizardRun=true\n' >$T/config/plasmamobilerc
 cat >$T/remote.conf <<CONF
 # s24-remote, for the nested test session
 port = 7181
+lan_port = 7444
 tunnel = ${S24RT_TUNNEL:-quick}
-phone_screen = on
+phone_screen = always
 grace_minutes = 1
 helper = /usr/local/libexec/s24-remote/openandroiddex-pmos
 CONF
@@ -24,7 +27,7 @@ cl kamd /usr/lib/libexec/kactivitymanagerd
 sleep 2
 cl plasmashell plasmashell -p org.kde.plasma.mobileshell
 sleep 4
-cl remote env S24_REMOTE_CONFIG=$T/remote.conf /usr/local/bin/s24-remote serve
-for i in $(seq 1 60); do grep -q '"url":"http' /run/user/10000/s24-remote/status.json 2>/dev/null && break; sleep 1; done
-cat /run/user/10000/s24-remote/status.json; echo
+cl remote env XDG_RUNTIME_DIR=$R S24_REMOTE_CONFIG=$T/remote.conf $BIN serve
+for i in $(seq 1 60); do grep -q '"url":"http' $R/s24-remote/status.json 2>/dev/null && break; sleep 1; done
+cat $R/s24-remote/status.json; echo
 echo setup done

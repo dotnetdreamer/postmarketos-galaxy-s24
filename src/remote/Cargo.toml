@@ -1,6 +1,6 @@
 [package]
 name = "s24-remote"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "MIT"
 description = "The phone's desktop in any browser, from anywhere: a tunnel, a door with a code, and the picture"
@@ -24,6 +24,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 ring = "0.17"
 time = { version = "0.3", default-features = false, features = ["std"] }
+# The second route for the picture: WebRTC (str0m, sans IO). Its pure-Rust crypto (dimpl DTLS,
+# RustCrypto) needs no C library, so this builds wherever the rest does
+str0m = { version = "0.25", default-features = false, features = ["rust-crypto"] }
 
 [profile.release]
 opt-level = 3

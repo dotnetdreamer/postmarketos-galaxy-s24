@@ -2,6 +2,10 @@
 # Nothing of the user's real session is used: own bus, own KWin (virtual backend, no input devices),
 # own config/data/cache dirs. Only XDG_RUNTIME_DIR is shared (PipeWire lives there).
 T=/tmp/s24rt
+# The test's s24-remote keeps its pid and status here, away from the real one's (PipeWire's socket and
+# the test KWin's are linked in), so the real Remote Desktop can stay on during the tests.
+R=/run/user/10000/s24rt-run
+BIN=${BIN:-/usr/local/bin/s24-remote}
 base_env="HOME=/home/user PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin USER=user LANG=C.UTF-8
 XDG_RUNTIME_DIR=/run/user/10000 XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data XDG_CACHE_HOME=$T/cache
 XDG_CONFIG_DIRS=$T/config/plasma-mobile:/etc/xdg DBUS_SESSION_BUS_ADDRESS=unix:path=$T/bus

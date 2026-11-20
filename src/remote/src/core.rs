@@ -4,6 +4,12 @@
 //! `Ev`. A browser that comes takes over from one that was there. A browser that goes leaves the
 //! screen up for `grace_minutes` (a reload or a dropped Wi-Fi comes back to the same windows), then
 //! the phone is locked, its screen comes back and goes dark, and the screen is put away.
+//!
+//! The picture has two routes to a browser: its WebSocket, and WebRTC once the browser offers it
+//! and the two ends reach each other (rtc.rs). While WebRTC comes up both take the frames; when the
+//! browser has shown one that came by WebRTC (`rtc-live`), the WebSocket stops getting them. If
+//! WebRTC drops, or no frame it carried is acknowledged for 2 s, the WebSocket has them again,
+//! from a key frame. One count of frames serves both, so an acknowledgement from either will do.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -18,13 +24,16 @@ use crate::flow::{fit, Flow, Quality, Release};
 use crate::h264;
 use crate::helper::{Helper, IN_KEY, IN_POINTER, MSG_VIDEO};
 use crate::phone::{self, Phone};
+use crate::rtc;
 use crate::say;
 use crate::status::{State, Status};
 use crate::util::base64;
 
 pub enum Ev {
-    /// A signed-in browser said hello.
-    Open { id: u64, tx: mpsc::UnboundedSender<Out>, hello: Value, who: String },
+    /// A signed-in browser said hello. `lan`: it came through the Wi-Fi door.
+    Open { id: u64, tx: mpsc::UnboundedSender<Out>, hello: Value, who: String, lan: bool },
+    /// From a browser's WebRTC session (`gen` tells one session from the one before it).
+    Rtc { id: u64, gen: u32, note: rtc::Note },
     Text { id: u64, v: Value },
     /// Pointer or key, as the helper takes them.
     Input { id: u64, data: Vec<u8> },
@@ -56,6 +65,24 @@ struct Viewer {
     seq: u32,
     t0: Instant,
     locked: Option<bool>,
+    /// It came through the Wi-Fi door: WebRTC on the local networks only.
+    lan: bool,
+    /// Its WebRTC session, while there is one.
+    rtc: Option<RtcRoute>,
+    /// The picture goes by WebRTC alone: the browser showed a frame that came that way.
+    on_rtc: bool,
+}
+
+/// A browser's WebRTC session, seen from here.
+struct RtcRoute {
+    link: rtc::Link,
+    gen: u32,
+    /// ICE and DTLS are up: it takes frames.
+    up: bool,
+    /// It takes frames from the next key frame on.
+    need_key: bool,
+    rtt_ms: Option<u32>,
+    loss: Option<f32>,
 }
 
 impl Viewer {
@@ -95,6 +122,10 @@ pub struct Core {
     last_sync: Instant,
     /// The second screen's panels looked after (panels.rs), once a run.
     panels_done: bool,
+    /// WebRTC sessions so far (each gets the next number).
+    rtc_gen: u32,
+    /// The bit rate the helper was told last.
+    helper_bitrate: u32,
 }
 
 const HELPER_NAME: &str = "S24Remote";
@@ -131,6 +162,8 @@ impl Core {
             last_lock_look: now,
             last_sync: now,
             panels_done: false,
+            rtc_gen: 0,
+            helper_bitrate: 0,
         }
     }
 
@@ -172,14 +205,10 @@ impl Core {
     async fn handle(&mut self, ev: Ev) {
         let now = Instant::now();
         match ev {
-            Ev::Open { id, tx, hello, who } => self.open(id, tx, hello, who, now).await,
+            Ev::Open { id, tx, hello, who, lan } => self.open(id, tx, hello, who, lan, now).await,
             Ev::Text { id, v } if self.is_current(id) => self.text(v, now).await,
-            Ev::Input { id, data } if self.is_current(id) => {
-                let ok = matches!((data.first(), data.len()), (Some(&IN_POINTER), 6) | (Some(&IN_KEY), 6));
-                if let (true, Some(h)) = (ok, &self.helper) {
-                    h.binary(&data);
-                }
-            }
+            Ev::Input { id, data } if self.is_current(id) => self.input(&data),
+            Ev::Rtc { id, gen, note } if self.is_current(id) => self.rtc_note(gen, note, now),
             Ev::Ack { id, seq } if self.is_current(id) => {
                 self.flow.acked(seq, now);
                 self.pump(now);
@@ -214,7 +243,7 @@ impl Core {
                     if let Some(v) = &self.viewer {
                         v.text(json!({"t": "phonescreen", "on": true, "why": "power"}));
                     }
-                } else if self.viewer.is_some() && self.ready {
+                } else if self.viewer.is_some() && self.ready && !self.cfg.phone_screen_always {
                     // The phone's screen is on beside the browser's: the press turns off the phone's,
                     // not both, as PowerDevil's answer to it would.
                     say!("power key: the phone's screen off again; the browser's stays");
@@ -233,7 +262,7 @@ impl Core {
         }
     }
 
-    async fn open(&mut self, id: u64, tx: mpsc::UnboundedSender<Out>, hello: Value, who: String, now: Instant) {
+    async fn open(&mut self, id: u64, tx: mpsc::UnboundedSender<Out>, hello: Value, who: String, lan: bool, now: Instant) {
         if let Some(old) = self.viewer.take() {
             say!("browser {} replaced by {who}", old.who);
             let _ = old.tx.send(Out::Text(json!({"t": "bye", "reason": "taken"}).to_string()));
@@ -247,7 +276,9 @@ impl Core {
             hello["w"].as_u64().unwrap_or(1280).clamp(320, 8192) as u32,
             hello["h"].as_u64().unwrap_or(720).clamp(240, 8192) as u32,
         );
-        if let Some(on) = hello["phoneScreen"].as_bool() {
+        if self.cfg.phone_screen_always {
+            self.phone_off = false;
+        } else if let Some(on) = hello["phoneScreen"].as_bool() {
             self.phone_off = !on;
         } else {
             self.phone_off = self.cfg.phone_screen_off;
@@ -264,8 +295,18 @@ impl Core {
             seq: 0,
             t0: now,
             locked: None,
+            lan,
+            rtc: None,
+            on_rtc: false,
         };
-        v.text(json!({"t": "welcome", "quality": q.name(), "phoneScreen": !self.phone_off}));
+        // WebRTC, if it's on: the STUN server for the browser to ask, except through the Wi-Fi door.
+        let rtc = if self.cfg.webrtc {
+            let stun = if lan { None } else { self.cfg.stun.as_ref().map(|s| format!("stun:{s}")) };
+            json!({ "stun": stun })
+        } else {
+            Value::Null
+        };
+        v.text(json!({"t": "welcome", "quality": q.name(), "phoneScreen": !self.phone_off, "rtc": rtc}));
         self.viewer = Some(v);
         say!("browser {who} connected ({}x{} window, {})", self.css.0, self.css.1, q.name());
         self.set_status(|s| {
@@ -291,6 +332,7 @@ impl Core {
     fn attach(&mut self, size: (u32, u32)) {
         if let Some(h) = &self.helper {
             h.text(&json!({"t": "hello", "v": 1, "acks": true, "w": size.0, "h": size.1, "bitrate": self.flow.bitrate}).to_string());
+            self.helper_bitrate = self.flow.bitrate;
             self.asked = size;
             self.flow.helper_reset();
         }
@@ -327,6 +369,7 @@ impl Core {
             Ok(h) => {
                 say!("helper: started (pid {}) for a {}x{} screen", h.id().unwrap_or(0), size.0, size.1);
                 self.helper = Some(h);
+                self.helper_bitrate = self.flow.bitrate;
                 self.ready = false;
                 self.sps.clear();
                 self.pps.clear();
@@ -397,6 +440,7 @@ impl Core {
                         self.resize();
                         if let Some(h) = &self.helper {
                             h.text(&json!({"t": "bitrate", "bitrate": self.flow.bitrate}).to_string());
+                            self.helper_bitrate = self.flow.bitrate;
                         }
                     }
                     if let Some(vw) = &self.viewer {
@@ -428,19 +472,47 @@ impl Core {
                 }
             }
             "phonescreen" => {
-                self.phone_off = !v["on"].as_bool().unwrap_or(false);
+                self.phone_off = !v["on"].as_bool().unwrap_or(false) && !self.cfg.phone_screen_always;
                 say!("phone: the browser asks for its screen {}", if self.phone_off { "off" } else { "on" });
                 self.phone_screen().await;
+            }
+            "rtc-offer" => self.rtc_offer(&v, now),
+            "rtc-cand" => {
+                if let (Some(c), Some(r)) = (v["c"].as_str(), self.viewer.as_ref().and_then(|vw| vw.rtc.as_ref())) {
+                    let _ = r.link.tx.send(rtc::Cmd::Remote(c.to_string()));
+                }
+            }
+            "rtc-live" => {
+                if let Some(vw) = self.viewer.as_mut() {
+                    if !vw.on_rtc && vw.rtc.as_ref().is_some_and(|r| r.up) {
+                        vw.on_rtc = true;
+                        // Whenever the WebSocket has the picture again, it starts from a key frame.
+                        vw.need_key = true;
+                        say!("browser {}: the picture by WebRTC", vw.who);
+                    }
+                }
+            }
+            "rtc-off" => {
+                let why = v["why"].as_str().unwrap_or("").chars().take(80).collect::<String>();
+                self.rtc_end(&format!("the browser: {why}"), false, now);
             }
             "pause" => {
                 if let Some(vw) = self.viewer.as_mut() {
                     vw.paused = true;
+                    // A hidden page shows no WebRTC frames, so it acknowledges none: those in flight
+                    // aren't waited for (the WebSocket's are: its decoder runs hidden too).
+                    if vw.on_rtc {
+                        self.flow.browser_reset();
+                    }
                 }
             }
             "resume" => {
                 if let Some(vw) = self.viewer.as_mut() {
                     vw.paused = false;
                     vw.need_key = true;
+                    if let Some(r) = vw.rtc.as_mut() {
+                        r.need_key = true;
+                    }
                 }
                 self.flow.browser_reset();
                 self.ask_key(now);
@@ -510,39 +582,58 @@ impl Core {
         }
         let key = f.key || data[1] != 0;
         let stalled = self.flow.stalled(now);
+        let overfull = self.flow.overfull();
         let mut want_key = false;
         if let Some(v) = self.viewer.as_mut() {
-            if v.paused || stalled || self.flow.overfull() {
+            if v.paused || stalled || overfull {
                 v.need_key = true;
-            } else if v.need_key && !key {
-                want_key = true;
-            } else if !f.avc.is_empty() {
-                let mut ok = true;
-                if !v.config_sent {
-                    match &self.video_config {
-                        Some(c) => {
-                            let _ = v.tx.send(Out::Text(c.clone()));
-                            v.config_sent = true;
-                        }
-                        None => ok = false,
-                    }
+                if let Some(r) = v.rtc.as_mut() {
+                    r.need_key = true;
                 }
-                if ok {
-                    v.need_key = false;
+            } else if !f.avc.is_empty() {
+                // The WebSocket takes frames unless the picture is on WebRTC, WebRTC once it is up:
+                // while it comes up, both. Each starts from a key frame.
+                let ws = !v.on_rtc;
+                let rtc_up = v.rtc.as_ref().is_some_and(|r| r.up);
+                let ws_take = ws && (!v.need_key || key) && (v.config_sent || self.video_config.is_some());
+                let rtc_take = rtc_up && v.rtc.as_ref().is_some_and(|r| !r.need_key || key);
+                if (ws && !ws_take) || (rtc_up && !rtc_take) {
+                    want_key = true;
+                }
+                if ws_take || rtc_take {
                     v.seq = v.seq.wrapping_add(1);
-                    let ts = now.duration_since(v.t0).as_millis() as u32;
-                    let mut msg = Vec::with_capacity(10 + f.avc.len());
-                    msg.push(MSG_VIDEO);
-                    msg.push(key as u8);
-                    msg.extend_from_slice(&v.seq.to_be_bytes());
-                    msg.extend_from_slice(&ts.to_be_bytes());
-                    msg.extend_from_slice(&f.avc);
-                    let n = msg.len();
-                    if v.tx.send(Out::Bin(Bytes::from(msg))).is_ok() {
-                        self.flow.sent(v.seq, n, key, now);
-                        self.frames += 1;
-                        self.bytes += n as u64;
+                    let mut n = 0;
+                    let mut acked = false;
+                    if ws_take {
+                        if !v.config_sent {
+                            if let Some(c) = &self.video_config {
+                                let _ = v.tx.send(Out::Text(c.clone()));
+                                v.config_sent = true;
+                            }
+                        }
+                        v.need_key = false;
+                        let ts = now.duration_since(v.t0).as_millis() as u32;
+                        let mut msg = Vec::with_capacity(10 + f.avc.len());
+                        msg.push(MSG_VIDEO);
+                        msg.push(key as u8);
+                        msg.extend_from_slice(&v.seq.to_be_bytes());
+                        msg.extend_from_slice(&ts.to_be_bytes());
+                        msg.extend_from_slice(&f.avc);
+                        n = msg.len();
+                        acked = v.tx.send(Out::Bin(Bytes::from(msg))).is_ok();
                     }
+                    if rtc_take {
+                        let r = v.rtc.as_mut().unwrap();
+                        r.need_key = false;
+                        let annex_b: Arc<[u8]> = Arc::from(&data[10..]);
+                        n = n.max(annex_b.len());
+                        acked |= r.link.tx.send(rtc::Cmd::Frame { data: annex_b, seq: v.seq }).is_ok();
+                    }
+                    if acked {
+                        self.flow.sent(v.seq, n, key, now);
+                    }
+                    self.frames += 1;
+                    self.bytes += n as u64;
                 }
             }
         }
@@ -571,6 +662,91 @@ impl Core {
         }
     }
 
+    /// Pointer or key, from the WebSocket or WebRTC's data channel.
+    fn input(&self, data: &[u8]) {
+        let ok = matches!((data.first(), data.len()), (Some(&IN_POINTER), 6) | (Some(&IN_KEY), 6));
+        if let (true, Some(h)) = (ok, &self.helper) {
+            h.binary(data);
+        }
+    }
+
+    /// The browser offers WebRTC: answer it (one session at a time; a new offer replaces the last).
+    fn rtc_offer(&mut self, v: &Value, now: Instant) {
+        let Some(vw) = self.viewer.as_ref() else { return };
+        if !self.cfg.webrtc {
+            vw.text(json!({"t": "rtc-end", "why": "off at the phone"}));
+            return;
+        }
+        let Some(sdp) = v["sdp"].as_str() else { return };
+        let (id, lan) = (vw.id, vw.lan);
+        self.rtc_end("a new offer", false, now);
+        self.rtc_gen += 1;
+        let gen = self.rtc_gen;
+        let opt = rtc::Options { lan_only: lan, stun: self.cfg.stun.clone() };
+        let started = rtc::start(id, gen, sdp, opt, self.events.clone());
+        let Some(vw) = self.viewer.as_mut() else { return };
+        match started {
+            Ok((link, answer)) => {
+                vw.text(json!({"t": "rtc-answer", "sdp": answer}));
+                vw.rtc = Some(RtcRoute { link, gen, up: false, need_key: true, rtt_ms: None, loss: None });
+                say!("webrtc: answered {} ({})", vw.who, if lan { "local networks only" } else { "STUN too" });
+            }
+            Err(e) => {
+                say!("webrtc: no session: {e}");
+                vw.text(json!({"t": "rtc-end", "why": e}));
+            }
+        }
+    }
+
+    fn rtc_note(&mut self, gen: u32, note: rtc::Note, now: Instant) {
+        let Some(vw) = self.viewer.as_mut() else { return };
+        let Some(r) = vw.rtc.as_mut().filter(|r| r.gen == gen) else { return };
+        match note {
+            rtc::Note::Up => {
+                r.up = true;
+                r.need_key = true;
+                self.ask_key(now);
+            }
+            rtc::Note::Local(c) => vw.text(json!({"t": "rtc-cand", "c": c})),
+            rtc::Note::Keyframe => {
+                r.need_key = true;
+                self.ask_key(now);
+            }
+            rtc::Note::Ack(seq) => {
+                self.flow.acked(seq, now);
+                self.pump(now);
+            }
+            rtc::Note::Input(data) => self.input(&data),
+            rtc::Note::Stats { rtt_ms, loss, .. } => {
+                r.rtt_ms = rtt_ms.or(r.rtt_ms);
+                r.loss = loss.or(r.loss);
+            }
+            rtc::Note::Down(why) => self.rtc_end(&why, true, now),
+        }
+    }
+
+    /// The WebRTC session over (it's dropped, which ends it); the WebSocket has the picture again.
+    fn rtc_end(&mut self, why: &str, tell: bool, now: Instant) {
+        let Some(vw) = self.viewer.as_mut() else { return };
+        if vw.rtc.take().is_none() {
+            return;
+        }
+        let was_on = std::mem::replace(&mut vw.on_rtc, false);
+        if was_on {
+            vw.need_key = true;
+            vw.config_sent = false;
+            say!("browser {}: the picture by the WebSocket again ({why})", vw.who);
+        }
+        if tell {
+            vw.text(json!({"t": "rtc-end", "why": why}));
+        }
+        if was_on {
+            // What went by WebRTC won't be acknowledged now.
+            self.flow.browser_reset();
+            self.ask_key(now);
+        }
+    }
+
     async fn helper_gone(&mut self, now: Instant) {
         let status = match self.helper.as_mut() {
             Some(h) => {
@@ -593,6 +769,9 @@ impl Core {
             if let Some(v) = self.viewer.as_mut() {
                 v.need_key = true;
                 v.config_sent = false;
+                if let Some(r) = v.rtc.as_mut() {
+                    r.need_key = true;
+                }
             }
             self.flow.browser_reset();
             self.start_helper(size, now);
@@ -623,27 +802,34 @@ impl Core {
             let secs = now.duration_since(self.last_second).as_secs_f64();
             self.last_second = now;
             let adjusted = if self.viewer.is_some() { self.flow.adjust(now) } else { None };
-            if let Some(b) = adjusted {
+            if let (Some(b), Some(h)) = (adjusted, &self.helper) {
                 say!("bitrate: {} kbit/s (round trip {} ms, link's own {} ms)", b / 1000, self.flow.srtt().as_millis(), self.flow.min_rtt().as_millis());
-                if let Some(h) = &self.helper {
-                    h.text(&json!({"t": "bitrate", "bitrate": b}).to_string());
-                }
+                h.text(&json!({"t": "bitrate", "bitrate": b}).to_string());
+                self.helper_bitrate = b;
             }
             if let Some(v) = &self.viewer {
+                let r = v.rtc.as_ref();
                 v.text(json!({
                     "t": "stats",
                     "fps": (self.frames as f64 / secs).round(),
                     "kbps": (self.bytes as f64 * 8.0 / 1000.0 / secs).round(),
                     "rtt": self.flow.srtt().as_millis() as u64,
-                    "bitrate": self.flow.bitrate / 1000,
+                    "bitrate": self.helper_bitrate / 1000,
                     "inflight": self.flow.in_flight(),
                     "w": self.asked.0, "h": self.asked.1,
                     "quality": self.flow.quality.name(),
                     "encoder": self.encoder,
+                    "route": if v.on_rtc { "webrtc" } else { "websocket" },
+                    "rtcRtt": r.and_then(|r| r.rtt_ms),
+                    "loss": r.and_then(|r| r.loss),
                 }));
             }
             self.frames = 0;
             self.bytes = 0;
+        }
+        // On WebRTC, 2 s without an acknowledgement is a route that stopped: the WebSocket takes over.
+        if self.flow.stalled(now) && self.viewer.as_ref().is_some_and(|v| v.on_rtc && !v.paused) {
+            self.rtc_end("nothing acknowledged for 2 s", true, now);
         }
         // Stalled: no acknowledgement for 2 s. A frozen tab answers nothing, but a page whose decoder
         // was reset has lost the frames inside it, and their acknowledgements with them: asked to

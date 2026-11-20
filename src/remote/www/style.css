@@ -140,7 +140,24 @@ body { background: var(--bg); color: var(--text); overflow: hidden; }
   outline: none;
   cursor: default;
   touch-action: none;
+  z-index: 1;
 }
+/* WebRTC's picture, exactly where the canvas is (fit() sizes both). Until its first frame is shown
+   it lies under the canvas, not hidden: a video that isn't drawn at all (display: none) may never
+   call requestVideoFrameCallback, and the page waits for that. Then .live puts it on top (same
+   z-index, later in the page). The canvas takes the pointer either way, and keeps the last picture
+   when the WebSocket has it again. */
+#rtc-video {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  object-fit: fill;
+  pointer-events: none;
+  background: #000;
+  z-index: 0;
+}
+#rtc-video.live { z-index: 1; }
 #typing {
   position: fixed;
   left: 0;

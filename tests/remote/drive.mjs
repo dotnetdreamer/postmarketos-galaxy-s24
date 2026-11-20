@@ -27,6 +27,9 @@ const cdpPort = await freePort();
 const profile = path.join(work, `profile-${cdpPort}`);
 const proc = spawn(exe, [...(visible ? [] : ['--headless=new']), `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profile}`,
   '--no-first-run', '--no-default-browser-check', '--disable-extensions', `--window-size=${W},${H}`, '--window-position=40,40',
+  // A visible window under someone's work stays drawn: without these, Edge counts a covered window
+  // as hidden, and a hidden page shows no WebRTC video (and acknowledges none)
+  '--disable-features=CalculateNativeWinOcclusion', '--disable-backgrounding-occluded-windows', '--disable-renderer-backgrounding',
   'about:blank'], { stdio: 'ignore' });
 function killBrowser() {
   try { proc.kill(); } catch { /* gone */ }

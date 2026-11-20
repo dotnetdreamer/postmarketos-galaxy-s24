@@ -29,6 +29,7 @@ mod lan;
 mod panels;
 mod password;
 mod phone;
+mod rtc;
 mod status;
 mod tunnel;
 mod util;

@@ -32,7 +32,7 @@ use tokio_tungstenite::WebSocketStream;
 use crate::auth::{Auth, Login};
 use crate::core::{Ev, Out};
 use crate::dbus::Ask;
-use crate::helper::{IN_ACK, IN_KEY, IN_POINTER};
+use crate::helper::{IN_ACK, IN_AWAKE, IN_KEY, IN_POINTER};
 use crate::say;
 use crate::status::Status;
 use crate::www;
@@ -342,6 +342,7 @@ async fn websocket(app: Arc<App>, mut req: Request<Incoming>, door: Door) -> Res
         return respond(StatusCode::BAD_REQUEST, "text/plain", "WebSocket only");
     }
     let from = who(&req, door);
+    let lan = matches!(door, Door::Lan { .. });
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
     let on_upgrade = hyper::upgrade::on(&mut req);
     let id = app.next_id.fetch_add(1, Ordering::Relaxed) + 1;
@@ -351,7 +352,7 @@ async fn websocket(app: Arc<App>, mut req: Request<Incoming>, door: Door) -> Res
             Ok(up) => {
                 let cfg = WebSocketConfig::default().max_message_size(Some(2 << 20)).max_frame_size(Some(2 << 20));
                 let ws = WebSocketStream::from_raw_socket(TokioIo::new(up), Role::Server, Some(cfg)).await;
-                viewer(ws, id, from, core).await;
+                viewer(ws, id, from, lan, core).await;
             }
             Err(e) => say!("websocket: upgrade failed: {e}"),
         }
@@ -366,7 +367,7 @@ async fn websocket(app: Arc<App>, mut req: Request<Incoming>, door: Door) -> Res
 }
 
 /// One browser's WebSocket, between it and the core.
-async fn viewer<S>(ws: WebSocketStream<S>, id: u64, from: String, core: mpsc::UnboundedSender<Ev>)
+async fn viewer<S>(ws: WebSocketStream<S>, id: u64, from: String, lan: bool, core: mpsc::UnboundedSender<Ev>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -388,7 +389,7 @@ where
                         if !opened {
                             if v["t"] == "hello" {
                                 opened = true;
-                                let _ = core.send(Ev::Open { id, tx: tx.take().unwrap(), hello: v, who: from.clone() });
+                                let _ = core.send(Ev::Open { id, tx: tx.take().unwrap(), hello: v, who: from.clone(), lan });
                             }
                             continue;
                         }
@@ -402,6 +403,8 @@ where
                         IN_POINTER | IN_KEY => {
                             let _ = core.send(Ev::Input { id, data: b.to_vec() });
                         }
+                        // It did its job by arriving: the Wi-Fi is awake.
+                        IN_AWAKE => {}
                         _ => {}
                     },
                     Message::Ping(p) => {

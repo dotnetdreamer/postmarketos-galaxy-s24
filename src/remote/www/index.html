@@ -41,6 +41,7 @@
 
 <div id="desk" hidden>
   <canvas id="screen" tabindex="0" aria-label="The phone's desktop"></canvas>
+  <video id="rtc-video" muted playsinline disablepictureinpicture disableremoteplayback></video>
   <textarea id="typing" aria-label="Typing" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
 
   <div id="handle" title="Menu"><span></span></div>
@@ -54,6 +55,7 @@
     <button id="b-keys" title="Show a keyboard (touch screens)">Keyboard</button>
     <button id="b-clip" aria-pressed="false" title="Share the clipboard with the phone">Clipboard</button>
     <button id="b-phone" aria-pressed="false" title="The phone's own screen while you're connected">Phone screen</button>
+    <button id="b-rtc" aria-pressed="true" title="WebRTC: the picture straight from the phone when it can reach this browser">WebRTC</button>
     <button id="b-stats" aria-pressed="false" title="Speed and delay">Info</button>
     <button id="b-access" title="This phone's addresses, and a password of your own">Access</button>
     <button id="b-bye" title="Disconnect">Disconnect</button>

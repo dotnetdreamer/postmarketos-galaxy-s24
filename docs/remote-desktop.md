@@ -5,6 +5,7 @@
 Also:
 
 - **On the same Wi-Fi**, a second address, `https://<the phone's address>:7443`, goes straight to the phone, not through the internet
+- **WebRTC when it can**: the picture, the mouse and the keys go straight between the phone and the browser (UDP, nothing in between) whenever the two can reach each other, through the internet address too. When they can't, the WebSocket carries them as before
 - **A password of your own**, set from the page, signs in from any browser without the code
 - **It stays on**: once turned on, it is on again after a restart, until it is turned off (the phone starts its desktop by itself, locked)
 - **The phone stays a phone** next to the browser's desktop, as with Samsung DeX: its own status bar and gestures, its apps full screen
@@ -20,7 +21,8 @@ Also:
    - **Keyboard**: brings up the on-screen keyboard on a tablet or phone
    - **Clipboard**: copy on one side, paste on the other (the browser asks once for permission)
    - **Phone screen**: whether the phone's own screen stays on while you are connected (off by default)
-   - **Info**: frames a second, speed and delay
+   - **WebRTC**: on (the default), the picture comes straight from the phone when it can; off, always by the WebSocket. This browser remembers it
+   - **Info**: which way the picture comes (WebRTC or the WebSocket), frames a second, speed and delay
    - **Access**: the phone's two addresses, and your own password (set, change, remove)
    - **Disconnect**
 5. To stop, tap the tile again, or **Turn off** in the notification
@@ -50,6 +52,22 @@ The first time, the browser warns that the connection isn't private: nobody can 
 
 The same code or password signs in. `lan = off` in the settings turns this address off.
 
+## WebRTC: straight to the browser
+
+A browser that has signed in also offers the phone WebRTC. When the two can reach each other directly, the picture, the mouse and the keys move to it within a second or two, and the WebSocket keeps the rest (sign-in, quality, the clipboard). Nothing is relayed, and nothing is installed:
+
+- **At home through the internet address**, WebRTC finds the phone on the same network, and the picture and the clicks cross the home network instead of going out to Cloudflare and back. Measured at the same time: a round trip of 6 to 20 ms on WebRTC against 22 to 72 ms for the WebSocket through the tunnel
+- **On the Wi-Fi address** both routes are direct already; WebRTC carries the picture there too
+- **Away from home**, WebRTC works when the two networks let a direct connection through (for that the phone asks Cloudflare's STUN server how the internet sees it). When they don't (strict NATs at both ends, a network that blocks UDP), the WebSocket keeps the picture. Away from home hasn't been tried yet
+- **If WebRTC drops**, the WebSocket has the picture again from its next key frame, and the page tries WebRTC again: soon after a route that worked, later after one that didn't connect, and after three of those not until it connects again
+- **Info** says which way the picture comes, for example `WebRTC, host/host udp, IPv6, round trip 9 ms`, with what the browser buffers and how long it decodes; or `WebSocket`
+- **WebRTC** in the menu turns it off for this browser, and on again
+- It needs a browser that can say which frame it showed (Chrome, Edge, Brave and Opera can). Anywhere else the page keeps the WebSocket. Tested in Edge only
+
+The page also keeps the phone's Wi-Fi awake while it is in front. A phone's Wi-Fi dozes between packets, and a click that arrives after a quiet moment waits for it to wake up. A byte every 50 ms keeps it awake: through the tunnel, the WebSocket's round trip went from 138 ms to 35 to 47 ms with it.
+
+`webrtc = off` in the settings turns WebRTC off at the phone.
+
 ## Your own password
 
 Under **Access** in the page (once signed in with the code), set a password of 8 characters or more. From then on, **Use your password instead** on the sign-in page takes it, on both addresses, from any browser: no need to look at the phone for a code. The code keeps working too. The phone shows a notification whenever the password is set or removed.
@@ -77,14 +95,16 @@ Cloudflare  ◄── the phone connects out to it       │
 cloudflared (on the phone)                         │
    │  http, 127.0.0.1:7180                         │
 s24-remote (Rust): the doors (code or password, cookie), the page, the pace
-   │  frames on stdin/stdout
+   │  frames on stdin/stdout          ═══ WebRTC: UDP straight to either browser when the two reach
+   │                                      each other (the picture, pointer, keys, acknowledgements)
 openandroiddex-pmos (C, from Open Android DeX): KWin's virtual screen, PipeWire, x264, KWin's fake input
 ```
 
 | Piece | Where | Job |
 |---|---|---|
 | `s24-remote` | `src/remote/` (Rust: tokio, hyper, tungstenite, zbus), installed as `/usr/local/bin/s24-remote` | Runs in the desktop session while Remote Desktop is on. Serves the page and the WebSocket on 127.0.0.1 only, signs browsers in, starts the tunnel and the screen program, paces the video to the browser's link, switches the phone's screen, holds the sleep lock, owns `org.s24.Remote` on the session bus |
-| The page | `src/remote/www/` (built into the program) | WebCodecs H.264 decoder, drawing on a canvas, mouse, keys, touch, the menu |
+| WebRTC | `src/remote/src/rtc.rs` (str0m 0.25, sans IO, its pure-Rust crypto) | Answers a browser's offer, offers the phone's addresses (and, through the tunnel, the one STUN sees), sends the frames as RTP with the playout delay at 0, takes pointer, keys and acknowledgements from two data channels. One task and one UDP socket per address, only while a session lasts |
+| The page | `src/remote/www/` (built into the program) | WebCodecs H.264 decoder, drawing on a canvas; WebRTC's video over it once the picture comes that way; mouse, keys, touch, the menu |
 | `cloudflared` | Cloudflare's own program, 2026.10.7, downloaded and checked against its SHA-256 by the install script | The way in from the internet |
 | `openandroiddex-pmos` | [Open Android DeX](https://github.com/dotnetdreamer/open-android-dex)'s `openandroiddex-pmos/`, installed as `/usr/local/libexec/s24-remote/openandroiddex-pmos` | Asks KWin for a screen, encodes it, types and points on it; also docked mode while it runs, apps opening on the screen they were opened from, the clipboard |
 | The tile | `rootfs/usr/share/plasma/quicksettings/org.s24.quicksetting.remote/` | Watches `org.s24.Remote`; its `Summary` property is the line under the name |
@@ -104,6 +124,8 @@ openandroiddex-pmos (C, from Open Android DeX): KWin's virtual screen, PipeWire,
 
 **The pace.** Across the internet the danger is not a slow picture but a late one: frames sent faster than the link carries pile up in buffers, and everything you do shows seconds later. So every frame is acknowledged by the browser once it is drawn, and the phone only encodes a new frame while few enough are in flight (twice what the link's own round trip holds at the frame rate, plus two, at least 4 and at most 12). Frames are dropped before they are encoded, never after: a dropped encoded frame would break the chain of frames that refer to it. The frame rate is capped by spacing those acknowledgements, and the bit rate is cut when frames start to queue and raised again when the link is clear. Details in `src/remote/src/flow.rs`.
 
+**WebRTC.** Straight only, no relay: a relay (TURN) needs an account or a server of one's own, and the WebSocket already reaches every network a relay would. str0m is sans IO, so it lives in one task beside everything else on the program's one thread. The phone paces WebRTC the way it paces the WebSocket: the page acknowledges each frame it showed (its RTP timestamp, from `requestVideoFrameCallback`) on an unordered data channel that never resends, and the window and bit rate of flow.rs follow those. str0m's own bandwidth estimate is off, because its pacer sends no faster than 1.1 times the estimate, and on a still desktop that estimate sank to a quarter of a megabit, which would have held a key frame back for over a second. Each frame carries the playout-delay extension at 0 (Chrome then shows a frame as soon as it is decoded), and the page sets its receiver's `jitterBufferTarget` to 0. Lost packets are resent on request (NACK, RTX), and a lost frame asks for a key frame (PLI). Pointer and keys go on an ordered, reliable data channel; the page changes their road only while nothing is held down, so a press and its release never take different roads. The video lies under the canvas until it has a frame and then goes on top, because a video that isn't drawn never calls back with what it showed. When WebRTC carries the picture, the video doesn't pass through Cloudflare at all.
+
 **The phone's own screen.** KWin has one screen-off state for all screens: the browser's screen and the phone's go dark together, and the first key or mouse move from either side lights both. A phone in a pocket would light up whenever the browser is used. So while a browser is connected the phone's panel is switched off as a screen (KWin moves everything to the browser's), and its touchscreen is held (a touch on a switched-off panel would land on the browser's screen). Holding it with `EVIOCGRAB` rather than through KWin's input settings matters: KWin saves "disabled" for the device, and a crash would leave the touchscreen dead after a restart; a grab ends with the process that holds it. If anything dies, KWin brings the panel back by itself as soon as the browser's screen is gone, because it keeps its screen settings per set of screens.
 
 **Docked mode.** The screen program turns Plasma Mobile's docked mode on while the browser's screen is up (movable windows with title bars) and back off after, as it does for Open Android DeX on a computer and as `s24-dockd` does for a USB-C monitor. Apps opened from the browser's screen open there.
@@ -122,6 +144,7 @@ openandroiddex-pmos (C, from Open Android DeX): KWin's virtual screen, PipeWire,
 - **The phone tells you.** Each browser that signs in gets a notification on the phone, with where it came from
 - **The phone's PIN still counts.** A locked phone shows its lock screen in the browser
 - **One browser at a time.** A second one takes over; the first is told so
+- **WebRTC only for a signed-in browser.** Its offer comes over the signed-in WebSocket, ICE's checks carry a password from it, and DTLS checks the browser's certificate against the fingerprint in it, so nobody else can take the other end. The phone's UDP sockets exist only while a session lasts, one per address of the phone's. A browser that came through the Wi-Fi door gets the local networks only, and no STUN server is asked for it
 
 Cloudflare carries the traffic over TLS to the browser, and can see it, as any reverse proxy can. On a computer whose network inspects TLS (some workplaces), the network can too.
 
@@ -133,7 +156,9 @@ Cloudflare carries the traffic over TLS to the browser, and can see it, as any r
 |---|---|---|
 | `tunnel` | `quick` | `quick`: a new trycloudflare.com address each time. `token`: a named Cloudflare tunnel with a fixed address (needs an account and a domain; also set `tunnel_token` and `hostname`, and point the tunnel at `http://localhost:7180`). `none`: no tunnel |
 | `grace_minutes` | `5` | How long the desktop waits for a browser that went away |
-| `phone_screen` | `off` | `on` keeps the phone's own screen on while a browser is connected (the page can switch it too) |
+| `phone_screen` | `off` | `on` keeps the phone's own screen on while a browser is connected (the page can switch it too). `always`: on, whatever a browser asks (the tests use this) |
+| `webrtc` | `on` | `off`: the WebSocket alone, never WebRTC |
+| `stun` | `stun.cloudflare.com:3478` | Asked how the internet sees the phone, for browsers that came through the tunnel (never for the Wi-Fi address). `off`: not asked, and WebRTC then works on the same network only |
 | `lan` | `on` | `off`: no Wi-Fi address, the tunnel only |
 | `lan_port` | `7443` | The Wi-Fi address's port |
 | `port` | `7180` | Where cloudflared reaches s24-remote, on 127.0.0.1 |
@@ -147,7 +172,7 @@ On the phone, from this repo: `sudo sh scripts/install-remote-desktop.sh [/path/
 
 The screen program comes from Open Android DeX (`openandroiddex-pmos/build.sh` builds it in Docker). Version 6 works; version 7 lets Low quality go below 2 Mbit/s and converts only the frames it encodes.
 
-Building `s24-remote` on a PC instead needs a C compiler for aarch64 Linux too (`ring`, the Wi-Fi door's and the password's cryptography, has C and assembly): building on the phone is simpler. The binary is about 3.4 MB.
+Building `s24-remote` on a PC instead needs a C compiler for aarch64 Linux too (`ring`, the Wi-Fi door's and the password's cryptography, has C and assembly; WebRTC's crypto pulls in AWS-LC, also C): building on the phone is simpler. The first build with WebRTC takes a few minutes, and the last step (a whole-program link) needs about a gigabyte free: with something big running beside it, the kernel killed it. The binary is about 7.4 MB (3.4 MB before WebRTC).
 
 ## Measured
 
@@ -172,6 +197,18 @@ The Wi-Fi door, the password and staying on (2026-11-20, version 1.1.0), on the 
 - Wi-Fi against the internet, from the same PC (`curl`, 20 requests of `/api/ping` on one connection per address, the first left out; in each round the two addresses one after the other): a request's round trip once the connection was up. Two rounds at 12:18: medians 10.1 and 8.0 ms on the Wi-Fi address against 74.7 and 59.2 ms through the tunnel. Four rounds at 14:31: 9.9, 10.8, 9.6 and 8.9 ms against 83.1, 59.6, 52.3 and 60.1 ms. Single requests took 5.4 to 34.5 ms on the Wi-Fi address and 35.4 to 247 ms through the tunnel. Not measured on the real desktop, on either address: a click to the screen (the tests don't click into the real session) and the picture's sharpness and frame rate
 - The phone as a phone: in the real session, both screens had their own status bar and navigation bar (screen 0 the browser's, with Plasma Mobile's own; screen 1 the phone's, with the new pair). The window rules per screen were tested in the nested session over two rounds of every move: phone windows full screen without title bars beside the browser's screen, desktop windows on the browser's screen, and back
 
+WebRTC (2026-11-20, version 1.2.0): first in the private nested session, with the new build running beside the real Remote Desktop (its own runtime folder), then in the real session. The browser was a visible Edge on a PC on the same home network. That PC is itself used over Windows Remote Desktop, so its screen draws 32 frames a second, and the test window was often behind other windows (Edge needs its occlusion detection off to keep drawing then):
+
+- Connecting: ICE and DTLS were up 50 to 199 ms after the answer, and the picture came by WebRTC about a second after sign-in. In the real session, through the Wi-Fi address and through the tunnel: host to host over IPv6, nothing lost. STUN found the phone's public IPv4
+- Round trips at the same time, real session, through the tunnel: 6 to 20 ms on WebRTC's direct path, 22 to 72 ms for the WebSocket through Cloudflare
+- A key to the changed picture (`flip.py` turns a window black or white, `latency.js` times it in the page), nested session, which spends about 110 ms of it in its own desktop. Through the tunnel, timed when the page draws, 40 presses each in alternating blocks of 10: WebRTC 124.4 ms ± 7.5, the WebSocket 125.7 ms ± 7.2 (means, 95%). No difference in this test bed: the phone and the PC share a network and Cloudflare's edge is near, so the direct path saved only about 10 to 20 ms, inside the noise. On the Wi-Fi address, where both are direct (timed every millisecond, which favours the WebSocket's canvas): medians 113 ms for WebRTC (one spike to 690 ms) and 109.5 ms for the WebSocket, 20 presses each
+- The keepalive byte: the WebSocket's round trip through the tunnel was 138 ms without it and 35 to 47 ms with it; a key to the picture, medians 163.5 and 135 ms (10 presses each)
+- A window animating on High: both routes showed 20 to 40 frames a second, with the bit rate cut to its floor and both routes' round trips spiking to 150 to 280 ms. The PC's network link also carried its own Remote Desktop session. Neither route did better
+- Typing over WebRTC's data channel into a test window: `Hello, World! 123` and Enter arrived exactly, and a click and a scroll too
+- Falling back: the WebRTC button off and on, in every A/B run: the route changed each time within a few seconds. With no way through (the page forced to use relays only, and there is none): three tries of 15 s, 5 and 10 s apart, and the WebSocket's picture all along. A page hidden for 6 s while on WebRTC (its window minimised): still on WebRTC afterwards. The phone falling back by itself after 2 s without an acknowledgement: seen while the test window was covered, before Edge's occlusion detection was turned off
+- Found and fixed on the way: str0m's pacer (above); a video not drawn yet (`display: none`, or under the canvas) never calls back, so the page waited forever; a hidden page sent no acknowledgements, and the phone would fall back
+- Unit tests: 45, among them a whole session against str0m playing the browser over real UDP on 127.0.0.1 (both frames whole, the playout delay at 0, an acknowledgement turned back into the frame's number, pointer bytes, a key frame request, the end)
+
 The tests (a private nested Plasma Mobile session on the phone for the desktop itself, the real session up to its lock screen and then unlocked, not by these tests, a browser driven over CDP through the real tunnel and the Wi-Fi door) are in [tests/remote/](../tests/remote/).
 
 ## Not done
@@ -180,7 +217,10 @@ The tests (a private nested Plasma Mobile session on the phone for the desktop i
 - **The pointer's shape** stays an arrow (KWin's screen is sent without the pointer, and its shape isn't passed on)
 - **No sound** in the browser
 - **The address changes** each time Remote Desktop is turned on, and after each restart (quick tunnel). The Wi-Fi address changes only when the router gives the phone a new one. A fixed internet address needs a Cloudflare account and a domain (`tunnel = token`)
-- **Cloudflare's terms.** Cloudflare says [quick tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/) are for testing and development, with no uptime guarantee, and points everyday use to a named tunnel (`tunnel = token`). For a tunnel's public address on its Free, Pro and Business plans, it [restricts video](https://developers.cloudflare.com/fundamentals/reference/policies-compliances/delivering-videos-with-cloudflare/) and may act on traffic that looks like video. The desktop's picture is a video stream, and Cloudflare's page doesn't say whether a remote desktop counts. The Wi-Fi address doesn't go through Cloudflare
+- **WebRTC away from home** (another network, mobile data, school or work) hasn't been tried. With no direct path the page keeps the WebSocket (tested by forcing it). There is no relay (TURN) for the networks in between
+- **WebRTC in Firefox and Safari**: untested. A browser that can't say which frame it showed keeps the WebSocket
+- **A key or a click to the screen on the real desktop**, either route: not timed (the tests don't type or click into the real session)
+- **Cloudflare's terms.** Cloudflare says [quick tunnels](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/) are for testing and development, with no uptime guarantee, and points everyday use to a named tunnel (`tunnel = token`). For a tunnel's public address on its Free, Pro and Business plans, it [restricts video](https://developers.cloudflare.com/fundamentals/reference/policies-compliances/delivering-videos-with-cloudflare/) and may act on traffic that looks like video. The desktop's picture is a video stream, and Cloudflare's page doesn't say whether a remote desktop counts. The Wi-Fi address doesn't go through Cloudflare, and neither does the picture when WebRTC carries it
 - **KWin moves windows back** to the phone's screen when it comes on again, if they were there before it went off
 - **The phone's own gestures and status bar on screen 1** were checked as panels on the screen, not with a finger: touch on the phone's screen beside the browser's is the owner's to try
 - **Networks that block it:** some filters block `trycloudflare.com` (the browser's side), and some networks block Cloudflare's tunnel port 7844 (the phone's side; mobile data doesn't). There is no fallback for proxies that refuse WebSockets

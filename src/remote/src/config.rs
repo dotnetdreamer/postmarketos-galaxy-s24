@@ -11,11 +11,32 @@
 //!                            cable's network), with the phone's own certificate; off: the tunnel only
 //!   lan_port = 7443          (the firewall rule opens 7443 on Wi-Fi and USB networks)
 //!   phone_screen = off       off: the phone's own screen is off while a browser is connected
-//!                            on: left as it is
+//!                            on: left as it is; always: left as it is, whatever a browser asks
+//!   webrtc = on              on: the picture, pointer and keys go straight to the browser over UDP
+//!                            when the two can reach each other (rtc.rs); off: the WebSocket only
+//!   stun = stun.cloudflare.com:3478   asked how the internet sees the phone, for a browser that
+//!                            came through the tunnel (never for the Wi-Fi address); off: not asked
 //!   helper = /path           openandroiddex-pmos (default: the first one found, see HELPERS)
 //!   cloudflared = /path      default: /usr/local/bin/cloudflared, then $PATH
 
 use std::path::{Path, PathBuf};
+
+/// Cloudflare's: the tunnel's traffic goes through Cloudflare already, and it asks for no account.
+pub const DEFAULT_STUN: &str = "stun.cloudflare.com:3478";
+
+/// `host`, `host:port` or `stun:host:port` (as a browser writes it); "off" or nothing: none.
+fn stun_server(v: &str) -> Option<String> {
+    let v = v.trim().trim_start_matches("stun:");
+    if v.is_empty() || v.eq_ignore_ascii_case("off") || v.contains(char::is_whitespace) {
+        return None;
+    }
+    // A bare IPv6 address needs its brackets before a port can follow.
+    let has_port = match v.rsplit_once(':') {
+        Some((h, p)) => !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) && (!h.contains(':') || h.ends_with(']')),
+        None => false,
+    };
+    Some(if has_port { v.to_string() } else if v.contains(':') && !v.starts_with('[') { format!("[{v}]:3478") } else { format!("{v}:3478") })
+}
 
 pub const HELPERS: &[&str] = &[
     "/usr/local/libexec/s24-remote/openandroiddex-pmos",
@@ -36,8 +57,13 @@ pub struct Config {
     pub hostname: Option<String>,
     pub grace_secs: u64,
     pub phone_screen_off: bool,
+    /// `phone_screen = always`: no browser turns the phone's screen off (or holds its touchscreen).
+    pub phone_screen_always: bool,
     pub lan: bool,
     pub lan_port: u16,
+    pub webrtc: bool,
+    /// `host:port`, or None: no STUN server is asked.
+    pub stun: Option<String>,
     pub helper: PathBuf,
     pub cloudflared: PathBuf,
 }
@@ -67,8 +93,11 @@ impl Config {
             hostname: None,
             grace_secs: 5 * 60,
             phone_screen_off: true,
+            phone_screen_always: false,
             lan: true,
             lan_port: 7443,
+            webrtc: true,
+            stun: Some(DEFAULT_STUN.to_string()),
             helper: HELPERS
                 .iter()
                 .map(|p| expand(p))
@@ -95,9 +124,14 @@ impl Config {
                 "tunnel_token" => token = Some(v.to_string()),
                 "hostname" if !v.is_empty() => c.hostname = Some(v.to_lowercase()),
                 "grace_minutes" => c.grace_secs = v.parse::<u64>().map(|m| m * 60).unwrap_or(c.grace_secs),
-                "phone_screen" => c.phone_screen_off = v != "on",
+                "phone_screen" => {
+                    c.phone_screen_always = v == "always";
+                    c.phone_screen_off = v != "on" && v != "always";
+                }
                 "lan" => c.lan = v != "off",
                 "lan_port" => c.lan_port = v.parse().ok().filter(|p| *p > 0).unwrap_or(c.lan_port),
+                "webrtc" => c.webrtc = v != "off",
+                "stun" => c.stun = stun_server(v),
                 "helper" => c.helper = expand(v),
                 "cloudflared" => c.cloudflared = expand(v),
                 _ => {}
@@ -129,6 +163,25 @@ mod tests {
         assert!(c.phone_screen_off);
         assert!(c.lan);
         assert_eq!(c.lan_port, 7443);
+        assert!(c.webrtc);
+        assert_eq!(c.stun.as_deref(), Some(DEFAULT_STUN));
+    }
+
+    #[test]
+    fn webrtc_keys() {
+        let c = Config::parse("webrtc = off
+stun = off
+");
+        assert!(!c.webrtc);
+        assert_eq!(c.stun, None);
+        assert_eq!(stun_server("stun.example.org"), Some("stun.example.org:3478".into()));
+        assert_eq!(stun_server("stun:stun.example.org:19302"), Some("stun.example.org:19302".into()));
+        assert_eq!(stun_server("192.0.2.1:3478"), Some("192.0.2.1:3478".into()));
+        assert_eq!(stun_server("2001:db8::1"), Some("[2001:db8::1]:3478".into()));
+        assert_eq!(stun_server("[2001:db8::1]:5000"), Some("[2001:db8::1]:5000".into()));
+        assert_eq!(stun_server("OFF"), None);
+        assert_eq!(stun_server(""), None);
+        assert_eq!(stun_server("a b"), None);
     }
 
     #[test]
@@ -142,8 +195,11 @@ mod tests {
         assert_eq!(c.hostname.as_deref(), Some("desk.example.org"));
         assert_eq!(c.grace_secs, 120);
         assert!(!c.phone_screen_off);
+        assert!(!c.phone_screen_always);
         assert!(!c.lan);
         assert_eq!(c.lan_port, 8443);
+        let always = Config::parse("phone_screen = always\n");
+        assert!(!always.phone_screen_off && always.phone_screen_always);
     }
 
     #[test]

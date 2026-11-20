@@ -24,6 +24,8 @@ pub const MSG_VIDEO: u8 = 0x01;
 pub const IN_POINTER: u8 = 0x10;
 pub const IN_KEY: u8 = 0x11;
 pub const IN_ACK: u8 = 0x12;
+/// From the page only, never to the helper: a byte that keeps the phone's Wi-Fi awake (app.js).
+pub const IN_AWAKE: u8 = 0x13;
 
 pub fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(5 + payload.len());

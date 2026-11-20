@@ -5,11 +5,20 @@
 // acknowledges every frame it showed, which is how the phone paces itself to this link. Pointer and
 // keys go back the same WebSocket. The pointer is this computer's own, so it moves at the screen's
 // rate whatever the video does.
+//
+// The second route: WebRTC. Once the page is up it offers the phone a WebRTC connection over the
+// WebSocket. When the two ends reach each other (UDP, straight, nothing relayed), the picture
+// comes that way into a video element over the canvas, shown the moment it is decoded (the
+// phone's playout delay of 0, and jitterBufferTarget 0 here); its frames are acknowledged on an
+// unordered data channel, and pointer and keys go on an ordered one. If it can't connect or
+// drops, the WebSocket has the picture again from its next key frame, and the page tries again.
 
 import { keysymFor, charKeysym, isMac } from './keys.js';
 
 const $ = (id) => document.getElementById(id);
 const IN_POINTER = 0x10, IN_KEY = 0x11, IN_ACK = 0x12, MSG_VIDEO = 0x01;
+// A byte the phone drops: see keepAwake().
+const AWAKE = new Uint8Array([0x13]);
 
 const store = {
   get(k, d) { try { return localStorage.getItem(k) ?? d; } catch { return d; } },
@@ -41,10 +50,19 @@ const s = {
   lastKeyAsk: 0,
   lastSeq: 0,
   locked: false,
+  // WebRTC
+  rtcConf: null,
+  rtc: null,
+  rtcOn: store.get('s24r.webrtc') !== 'off',
+  rtcTries: 0,
+  rtcFlaps: 0,
+  rtcTimer: 0,
+  inputVia: 'ws',
 };
 
 const canvas = $('screen');
 const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+const video = $('rtc-video');
 
 // ── what is on screen ───────────────────────────────────────────────────
 
@@ -209,6 +227,7 @@ function connect() {
     if (s.clip) send({ t: 'clipshare', on: true });
     s.timers.push(setInterval(() => send({ t: 'ping', n: performance.now() }), 2000));
     s.timers.push(setInterval(renderStats, 1000));
+    s.timers.push(setInterval(keepAwake, 50));
   };
   ws.onmessage = (e) => {
     if (typeof e.data === 'string') {
@@ -227,6 +246,8 @@ async function onClosed(ws) {
   s.ws = null;
   for (const t of s.timers) clearInterval(t);
   s.timers = [];
+  clearTimeout(s.rtcTimer);
+  if (s.rtc) rtcStop(s.rtc, 'the WebSocket closed', false);
   closeDecoder();
   releaseAll(false);
   if (s.bye === 'taken') return cover('Your desktop was opened in another browser.', 'Use it here');
@@ -253,6 +274,25 @@ function onText(m) {
     case 'welcome':
       setQuality(m.quality, false);
       setPhoneScreen(m.phoneScreen);
+      s.rtcConf = m.rtc || null;
+      s.rtcTries = 0;
+      scheduleRtc(300);
+      break;
+    case 'rtc-answer':
+      if (s.rtc && typeof m.sdp === 'string') {
+        const r = s.rtc;
+        r.answered = r.pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+        r.answered.catch((e) => rtcStop(r, 'the answer: ' + e, true));
+      }
+      break;
+    case 'rtc-cand':
+      if (s.rtc && s.rtc.answered && typeof m.c === 'string') {
+        const r = s.rtc;
+        r.answered.then(() => r.pc.addIceCandidate({ candidate: m.c, sdpMLineIndex: 0 })).catch(() => {});
+      }
+      break;
+    case 'rtc-end':
+      if (s.rtc) rtcStop(s.rtc, 'the phone: ' + (m.why || 'ended'), false);
       break;
     case 'state':
       if (m.state === 'starting') cover(m.message || "Starting the phone's desktop…");
@@ -298,6 +338,23 @@ function onText(m) {
       s.needKey = true;
       break;
   }
+}
+
+// The phone's Wi-Fi dozes between packets, and a packet to it then waits for its next wake-up:
+// measured, the WebSocket's round trip through the tunnel was 138 ms with nothing else going and
+// 35 to 47 ms with a byte every 20 ms. A click or a key would wait the same. So while this page is
+// in front, a byte every 50 ms keeps the radio awake, on WebRTC's acknowledgement channel when the
+// picture comes that way, else on the WebSocket. The phone drops it.
+function keepAwake() {
+  if (document.hidden) return;
+  const r = s.rtc;
+  if (r && r.live && r.ackCh && r.ackCh.readyState === 'open') {
+    try {
+      r.ackCh.send(AWAKE);
+      return;
+    } catch { /* closing: the WebSocket, then */ }
+  }
+  sendBin(AWAKE);
 }
 
 // ── video ───────────────────────────────────────────────────────────────
@@ -435,6 +492,8 @@ function fit() {
   if (k >= 1 && k < 1.03) k = 1;
   canvas.style.width = W * k + 'px';
   canvas.style.height = H * k + 'px';
+  video.style.width = canvas.style.width;
+  video.style.height = canvas.style.height;
 }
 
 let resizeTimer = 0;
@@ -456,6 +515,243 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+// ── WebRTC: the second route ────────────────────────────────────────────
+
+// The H.264 this browser's WebRTC takes in fragments (packetization-mode 1), constrained
+// baseline first: what the phone's x264 makes. Empty: no WebRTC here.
+function h264Codecs() {
+  try {
+    const caps = RTCRtpReceiver.getCapabilities && RTCRtpReceiver.getCapabilities('video');
+    if (!caps) return [];
+    const f = (c) => c.sdpFmtpLine || '';
+    const rank = (c) => (/profile-level-id=42e0/i.test(f(c)) ? 0 : /profile-level-id=4200/i.test(f(c)) ? 1 : 2);
+    return caps.codecs
+      .filter((c) => /^video\/h264$/i.test(c.mimeType) && /packetization-mode=1/.test(f(c)))
+      .sort((a, b) => rank(a) - rank(b))
+      .concat(caps.codecs.filter((c) => /^video\/rtx$/i.test(c.mimeType)));
+  } catch {
+    return [];
+  }
+}
+
+// WebRTC only where the page can say which frame it showed (requestVideoFrameCallback's RTP
+// timestamp): the phone paces itself by that. Elsewhere the WebSocket, which always can.
+function rtcPossible() {
+  return s.rtcOn && !!s.rtcConf && !s.rtcNoAcks && typeof RTCPeerConnection === 'function' &&
+    'requestVideoFrameCallback' in HTMLVideoElement.prototype &&
+    !!s.ws && s.ws.readyState === WebSocket.OPEN && !s.rtc && h264Codecs().length > 0;
+}
+
+function scheduleRtc(ms) {
+  clearTimeout(s.rtcTimer);
+  s.rtcTimer = setTimeout(startRtc, ms);
+}
+
+async function startRtc() {
+  if (!rtcPossible()) return;
+  let pc;
+  try {
+    pc = new RTCPeerConnection({
+      iceServers: s.rtcConf.stun ? [{ urls: s.rtcConf.stun }] : [],
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+    });
+  } catch (e) {
+    console.warn('webrtc:', e);
+    return;
+  }
+  const r = { pc, live: false, answered: null, timer: 0, stats: null, lastIn: null };
+  s.rtc = r;
+  const tr = pc.addTransceiver('video', { direction: 'recvonly' });
+  try { tr.setCodecPreferences(h264Codecs()); } catch { /* the browser's own order, then */ }
+  r.inCh = pc.createDataChannel('in', { ordered: true });
+  r.ackCh = pc.createDataChannel('ack', { ordered: false, maxRetransmits: 0 });
+  pc.onicecandidate = (e) => {
+    if (s.rtc === r && e.candidate && e.candidate.candidate) send({ t: 'rtc-cand', c: e.candidate.candidate });
+  };
+  pc.ontrack = (e) => {
+    if (s.rtc !== r) return;
+    // No buffer to smooth the picture with: shown as soon as it is decoded.
+    try { e.receiver.jitterBufferTarget = 0; } catch { /* older browser */ }
+    try { e.receiver.playoutDelayHint = 0; } catch { /* older browser */ }
+    video.srcObject = new MediaStream([e.track]);
+    video.play().catch(() => {});
+    // On top as soon as it has a picture: a video under the canvas isn't drawn, and an undrawn
+    // video never calls requestVideoFrameCallback (seen in Edge), which is where the
+    // acknowledgements come from.
+    const ready = () => { if (s.rtc === r && !r.live && video.readyState >= 2 && video.videoWidth) goLive(r); };
+    video.addEventListener('loadeddata', ready, { once: true });
+    video.addEventListener('playing', ready, { once: true });
+    watchFrames(r);
+  };
+  pc.onconnectionstatechange = () => {
+    const st = pc.connectionState;
+    if (st === 'failed' || st === 'closed' || (st === 'disconnected' && r.live)) rtcStop(r, 'connection ' + st, true);
+  };
+  try {
+    await pc.setLocalDescription(await pc.createOffer());
+  } catch (e) {
+    rtcStop(r, 'the offer: ' + e, false);
+    return;
+  }
+  if (s.rtc !== r) return;
+  send({ t: 'rtc-offer', sdp: pc.localDescription.sdp });
+  r.timer = setTimeout(() => { if (s.rtc === r && !r.live) rtcStop(r, 'no picture in 15 s', true); }, 15000);
+}
+
+// Each frame shown: acknowledged by its RTP timestamp, which the phone turns back into its frame
+// number. The first one puts the video over the canvas.
+function watchFrames(r) {
+  const shown = (now, meta) => {
+    if (s.rtc !== r) return;
+    if (!meta || typeof meta.rtpTimestamp !== 'number') {
+      // No way to say which frame this was: the WebSocket, for good on this page.
+      s.rtcNoAcks = true;
+      rtcStop(r, 'this browser cannot say which frame it showed', true);
+      return;
+    }
+    if (!r.live) goLive(r);
+    s.frames++;
+    if (r.ackCh.readyState === 'open') {
+      const b = new Uint8Array(4);
+      new DataView(b.buffer).setUint32(0, meta.rtpTimestamp >>> 0);
+      try { r.ackCh.send(b); } catch { /* closing */ }
+    }
+    video.requestVideoFrameCallback(shown);
+  };
+  video.requestVideoFrameCallback(shown);
+}
+
+function sizeFromVideo() {
+  const w = video.videoWidth, h = video.videoHeight;
+  if (w && h && (canvas.width !== w || canvas.height !== h)) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  fit();
+}
+
+video.addEventListener('resize', () => { if (s.rtc && s.rtc.live) sizeFromVideo(); });
+
+function goLive(r) {
+  r.live = true;
+  r.liveAt = performance.now();
+  clearTimeout(r.timer);
+  s.rtcTries = 0;
+  sizeFromVideo();
+  video.classList.add('live');
+  send({ t: 'rtc-live' });
+  if (!s.drawn) {
+    s.drawn = true;
+    uncover();
+  }
+}
+
+function rtcStop(r, why, tell) {
+  if (!r || s.rtc !== r) return;
+  s.rtc = null;
+  clearTimeout(r.timer);
+  if (r.live) {
+    // The last picture stays on the canvas until the WebSocket's key frame.
+    try {
+      if (video.videoWidth) {
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        fit();
+      }
+    } catch { /* nothing to keep */ }
+    s.needKey = true;
+  }
+  video.classList.remove('live');
+  video.srcObject = null;
+  try { r.pc.close(); } catch { /* closed */ }
+  if (tell) send({ t: 'rtc-off', why: String(why).slice(0, 80) });
+  console.info('webrtc: ended:', why);
+  // Again: soon after a route that worked a while, later and later after one that dropped soon
+  // after it started (no flapping), later after one that never came up; after 3 of those, not until
+  // the next WebSocket.
+  if (s.rtcOn && s.ws) {
+    if (r.live) {
+      s.rtcFlaps = performance.now() - r.liveAt < 10000 ? s.rtcFlaps + 1 : 0;
+      scheduleRtc(Math.min(60000, 2000 * 2 ** s.rtcFlaps));
+    } else if (++s.rtcTries < 3) scheduleRtc(5000 * s.rtcTries);
+  }
+}
+
+// Pointer and keys: by WebRTC's data channel once the picture comes that way, else the WebSocket.
+// The road changes only while nothing is held down, so a press and its release never take
+// different ones (the faster could overtake).
+const held = { mask: 0, keys: new Set() };
+
+function sendInput(bytes) {
+  const r = s.rtc;
+  const ch = r && r.live && r.inCh && r.inCh.readyState === 'open' ? r.inCh : null;
+  if (held.mask === 0 && held.keys.size === 0) s.inputVia = ch ? 'rtc' : 'ws';
+  else if (!ch) s.inputVia = 'ws';
+  // Wheel clicks too: their press and release must not take different roads either.
+  if (bytes[0] === IN_POINTER) held.mask = bytes[1];
+  else if (bytes[0] === IN_KEY) {
+    const ks = new DataView(bytes.buffer, bytes.byteOffset).getUint32(2);
+    if (bytes[1]) held.keys.add(ks);
+    else held.keys.delete(ks);
+  }
+  if (s.inputVia === 'rtc') {
+    try {
+      ch.send(bytes);
+      return;
+    } catch {
+      s.inputVia = 'ws';
+    }
+  }
+  sendBin(bytes);
+}
+
+function setRtcOn(on) {
+  s.rtcOn = on;
+  store.set('s24r.webrtc', on ? 'on' : 'off');
+  const b = $('b-rtc');
+  b.setAttribute('aria-pressed', String(on));
+  b.title = on
+    ? 'WebRTC: the picture straight from the phone when it can reach this browser (click for the WebSocket only)'
+    : 'The WebSocket only (click to let WebRTC take the picture when it can)';
+  if (!on && s.rtc) rtcStop(s.rtc, 'turned off in the menu', true);
+  if (on) {
+    s.rtcTries = 0;
+    scheduleRtc(100);
+  }
+}
+
+$('b-rtc').addEventListener('click', () => setRtcOn(!s.rtcOn));
+
+// What WebRTC says about itself, for Info.
+async function rtcStats(r) {
+  try {
+    const rep = await r.pc.getStats();
+    let transport = null, inbound = null, pair = null;
+    rep.forEach((x) => {
+      if (x.type === 'transport') transport = x;
+      if (x.type === 'inbound-rtp' && x.kind === 'video') inbound = x;
+    });
+    if (transport && transport.selectedCandidatePairId) pair = rep.get(transport.selectedCandidatePairId);
+    if (!pair) rep.forEach((x) => { if (x.type === 'candidate-pair' && x.nominated && x.state === 'succeeded') pair = x; });
+    const local = pair && rep.get(pair.localCandidateId), remote = pair && rep.get(pair.remoteCandidateId);
+    const prev = r.lastIn;
+    r.lastIn = inbound;
+    const per = (a, b) => (inbound && prev && inbound[b] > prev[b] ? Math.round((1000 * (inbound[a] - prev[a])) / (inbound[b] - prev[b])) : null);
+    r.stats = {
+      how: local && remote ? `${local.candidateType}/${remote.candidateType} ${local.protocol}${(remote.address || '').includes(':') ? ', IPv6' : ''}` : '',
+      rtt: pair && pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+      buffer: per('jitterBufferDelay', 'jitterBufferEmittedCount'),
+      decode: per('totalDecodeTime', 'framesDecoded'),
+      kbps: inbound && prev && inbound.timestamp > prev.timestamp
+        ? Math.round(((inbound.bytesReceived - prev.bytesReceived) * 8) / (inbound.timestamp - prev.timestamp)) : null,
+      lost: inbound ? inbound.packetsLost || 0 : 0,
+      decoder: inbound ? inbound.decoderImplementation || '' : '',
+    };
+  } catch { /* closed meanwhile */ }
+}
+
 // ── pointer ─────────────────────────────────────────────────────────────
 
 let last = { x: 0, y: 0 };
@@ -474,7 +770,7 @@ function sendPointer(mask, p = last) {
   b[1] = mask;
   b[2] = p.x >> 8; b[3] = p.x & 255;
   b[4] = p.y >> 8; b[5] = p.y & 255;
-  sendBin(b);
+  sendInput(b);
 }
 
 const BUTTON_BIT = [1, 2, 4, 128];
@@ -602,7 +898,7 @@ function sendKey(down, keysym) {
   b[0] = IN_KEY;
   b[1] = down ? 1 : 0;
   new DataView(b.buffer).setUint32(2, keysym);
-  sendBin(b);
+  sendInput(b);
 }
 
 function tap(keysym) {
@@ -862,18 +1158,28 @@ $('pass-remove').addEventListener('click', async () => {
 
 function renderStats() {
   const fps = s.frames;
-  const kbps = Math.round((s.bytes * 8) / 1000);
+  let kbps = Math.round((s.bytes * 8) / 1000);
   s.frames = 0;
   s.bytes = 0;
+  const r = s.rtc;
+  if (r) rtcStats(r);
   const el = $('stats');
   if (el.hidden) return;
   const m = s.server || {};
+  const st = r && r.live ? r.stats : null;
+  if (st && st.kbps != null) kbps = st.kbps;
+  let route = 'WebSocket' + (r ? ' (WebRTC connecting…)' : s.rtcOn && s.rtcConf ? '' : ', WebRTC off');
+  if (st) {
+    route = `WebRTC, ${st.how || 'direct'}` + (st.rtt != null ? `, round trip ${st.rtt} ms` : '');
+  }
   el.textContent =
     `${m.w || canvas.width}×${m.h || canvas.height}  ${m.quality || s.quality}  ${m.encoder || ''}\n` +
+    `${route}\n` +
     `${fps} fps shown, ${(kbps / 1000).toFixed(1)} Mbit/s\n` +
+    (st ? `buffer ${st.buffer ?? '?'} ms, decode ${st.decode ?? '?'} ms, ${st.lost} lost${st.decoder ? ', ' + st.decoder : ''}\n` : '') +
     `delay ${Math.round(s.rtt)} ms, frames ${m.rtt ?? '?'} ms\n` +
     `encoder target ${m.bitrate ?? '?'} kbit/s, ${m.inflight ?? '?'} in flight` +
-    (s.software ? '\nsoftware decoding' : '');
+    (s.software && !st ? '\nsoftware decoding' : '');
 }
 
 // ── start ───────────────────────────────────────────────────────────────
@@ -883,6 +1189,7 @@ addEventListener('pagehide', () => { if (s.ws) s.ws.close(); });
 async function main() {
   setQuality(s.quality, false);
   $('b-clip').setAttribute('aria-pressed', String(s.clip));
+  $('b-rtc').setAttribute('aria-pressed', String(s.rtcOn));
   if (!window.isSecureContext || typeof VideoDecoder === 'undefined') {
     show('nope');
     return;
