@@ -1,10 +1,12 @@
 //! The door: the page, the sign-in, and the WebSocket the desktop travels on.
 //!
-//! It listens on 127.0.0.1 only: the one way in from outside is the tunnel. Every request must
-//! name the tunnel's address (or this phone's own 127.0.0.1) in Host, which keeps another site's
-//! page from reaching it through a name of its own (DNS rebinding); everything that changes
-//! something, and the WebSocket, must come from this origin's own page (Origin); the cookie is
-//! HttpOnly, Secure and SameSite=Strict, and the page may load nothing from anywhere else (CSP).
+//! Two ways in, the same door behind both: 127.0.0.1, which only the tunnel reaches from outside,
+//! and the Wi-Fi door (lan.rs, HTTPS on the phone's own address). Every request must name an
+//! address of its way in, in Host (the tunnel's, or this phone's own address on that network),
+//! which keeps another site's page from reaching it through a name of its own (DNS rebinding);
+//! everything that changes something, and the WebSocket, must come from this origin's own page
+//! (Origin); the cookie is HttpOnly, Secure and SameSite=Strict, and the page may load nothing from
+//! anywhere else (CSP).
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -29,6 +31,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::auth::{Auth, Login};
 use crate::core::{Ev, Out};
+use crate::dbus::Ask;
 use crate::helper::{IN_ACK, IN_KEY, IN_POINTER};
 use crate::say;
 use crate::status::Status;
@@ -44,6 +47,19 @@ pub struct App {
     pub next_id: AtomicU64,
     /// The named tunnel's address, when there is one (the quick tunnel's is in status).
     pub hostname: Option<String>,
+    /// This phone's name (galaxy-s24), for the Wi-Fi door's Host check.
+    pub machine: String,
+    /// Notifications on the phone (a password changed).
+    pub asks: mpsc::UnboundedSender<Ask>,
+}
+
+/// Which way a request came in.
+#[derive(Clone, Copy, Debug)]
+pub enum Door {
+    /// 127.0.0.1: the tunnel, or a browser on the phone itself.
+    Local { peer: SocketAddr },
+    /// The Wi-Fi door (lan.rs), on this address of the phone's.
+    Lan { peer: SocketAddr, local: SocketAddr },
 }
 
 type Resp = Response<Full<Bytes>>;
@@ -88,8 +104,13 @@ fn cookie_token(req: &Request<Incoming>) -> Option<String> {
     None
 }
 
-/// Where a browser came from, as Cloudflare saw it.
-fn who(req: &Request<Incoming>, peer: SocketAddr) -> String {
+/// Where a browser came from: as Cloudflare saw it, or on this Wi-Fi. (Cloudflare's headers count
+/// only from the tunnel: on the Wi-Fi anyone could send them.)
+fn who(req: &Request<Incoming>, door: Door) -> String {
+    let peer = match door {
+        Door::Lan { peer, .. } => return format!("{} on this Wi-Fi", crate::lan::canonical(peer.ip())),
+        Door::Local { peer } => peer,
+    };
     let ip = header_str(req, "cf-connecting-ip");
     let country = header_str(req, "cf-ipcountry");
     let ip: String = if ip.is_empty() { peer.ip().to_string() } else { ip.chars().filter(|c| c.is_ascii_hexdigit() || ".:".contains(*c)).take(45).collect() };
@@ -102,8 +123,11 @@ fn who(req: &Request<Incoming>, peer: SocketAddr) -> String {
 }
 
 impl App {
-    /// The Host header is one of ours.
-    fn host_ok(&self, host: &str) -> bool {
+    /// The Host header is one of ours, for the way the request came in.
+    fn host_ok(&self, host: &str, door: Door) -> bool {
+        if let Door::Lan { local, .. } = door {
+            return crate::lan::host_is_ours(host, local, &self.machine);
+        }
         let host = host.to_ascii_lowercase();
         let local = [format!("127.0.0.1:{}", self.port), format!("localhost:{}", self.port)];
         if local.contains(&host) {
@@ -131,6 +155,7 @@ impl App {
     }
 }
 
+/// The 127.0.0.1 door (the tunnel's).
 pub async fn serve(app: Arc<App>, listener: TcpListener) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -143,38 +168,51 @@ pub async fn serve(app: Arc<App>, listener: TcpListener) {
         };
         let _ = stream.set_nodelay(true);
         let app = app.clone();
-        tokio::spawn(async move {
-            let svc = service_fn(move |req| {
-                let app = app.clone();
-                async move { Ok::<_, Infallible>(route(app, req, peer).await) }
-            });
-            let conn = hyper::server::conn::http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .keep_alive(true)
-                .header_read_timeout(Duration::from_secs(20))
-                .serve_connection(TokioIo::new(stream), svc)
-                .with_upgrades();
-            let _ = conn.await;
-        });
+        tokio::spawn(serve_conn(app, stream, Door::Local { peer }));
     }
 }
 
-async fn route(app: Arc<App>, req: Request<Incoming>, peer: SocketAddr) -> Resp {
+/// One connection, either door's (the Wi-Fi door's after TLS).
+pub async fn serve_conn<S>(app: Arc<App>, stream: S, door: Door)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let svc = service_fn(move |req| {
+        let app = app.clone();
+        async move { Ok::<_, Infallible>(route(app, req, door).await) }
+    });
+    let conn = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive(true)
+        .header_read_timeout(Duration::from_secs(20))
+        .serve_connection(TokioIo::new(stream), svc)
+        .with_upgrades();
+    let _ = conn.await;
+}
+
+async fn route(app: Arc<App>, req: Request<Incoming>, door: Door) -> Resp {
     let host = header_str(&req, "host").to_string();
-    if !app.host_ok(&host) {
+    if !app.host_ok(&host, door) {
         return respond(StatusCode::MISDIRECTED_REQUEST, "text/plain", "Not this address");
     }
     let path = req.uri().path().to_string();
     match (req.method(), path.as_str()) {
         (&Method::GET, "/api/ping") => respond(StatusCode::OK, "text/plain", "ok"),
         (&Method::GET, "/api/session") => match app.signed_in(&req) {
-            Some(_) => json_resp(StatusCode::OK, json!({"ok": true})),
+            Some(_) => {
+                let (url, lan) = {
+                    let s = app.status.borrow();
+                    (s.url.clone(), s.lan_url.clone())
+                };
+                json_resp(StatusCode::OK, json!({"ok": true, "password": crate::password::is_set(), "url": url, "lan": lan}))
+            }
             None => {
                 let locked = app.auth.lock().unwrap().locked_for(Instant::now()).map(|d| d.as_secs()).unwrap_or(0);
                 json_resp(StatusCode::UNAUTHORIZED, json!({"ok": false, "locked": locked}))
             }
         },
-        (&Method::POST, "/api/login") => login(app, req, peer).await,
+        (&Method::POST, "/api/login") => login(app, req, door).await,
+        (&Method::POST, "/api/password") => set_password(app, req, door).await,
         (&Method::POST, "/api/logout") => {
             if !app.origin_ok(&req) {
                 return respond(StatusCode::FORBIDDEN, "text/plain", "Not from this page");
@@ -189,7 +227,7 @@ async fn route(app: Arc<App>, req: Request<Incoming>, peer: SocketAddr) -> Resp 
             );
             r
         }
-        (&Method::GET, "/ws") => websocket(app, req, peer).await,
+        (&Method::GET, "/ws") => websocket(app, req, door).await,
         (&Method::GET, p) => match www::file(p) {
             Some((ctype, body)) => respond(StatusCode::OK, ctype, Bytes::from_static(body)),
             None => respond(StatusCode::NOT_FOUND, "text/plain", "Not found"),
@@ -198,11 +236,11 @@ async fn route(app: Arc<App>, req: Request<Incoming>, peer: SocketAddr) -> Resp 
     }
 }
 
-async fn login(app: Arc<App>, req: Request<Incoming>, peer: SocketAddr) -> Resp {
+async fn login(app: Arc<App>, req: Request<Incoming>, door: Door) -> Resp {
     if !app.origin_ok(&req) {
         return respond(StatusCode::FORBIDDEN, "text/plain", "Not from this page");
     }
-    let from = who(&req, peer);
+    let from = who(&req, door);
     let body = match Limited::new(req.into_body(), 1024).collect().await {
         Ok(b) => b.to_bytes(),
         Err(_) => return respond(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "Too long"),
@@ -213,10 +251,19 @@ async fn login(app: Arc<App>, req: Request<Incoming>, peer: SocketAddr) -> Resp 
         .unwrap_or_default();
     // One try at a time, from everywhere at once.
     let _turn = app.login_turn.lock().await;
-    let result = app.auth.lock().unwrap().login(&code, &from, Instant::now());
+    // The password's hash takes a fifth of a second: worked out on another thread, so the picture
+    // (this runtime's one thread) doesn't stop for it, and only when what was typed isn't the code.
+    let is_code = app.auth.lock().unwrap().is_code(&code);
+    let password_ok = if is_code || code.is_empty() {
+        false
+    } else {
+        let typed = code.clone();
+        tokio::task::spawn_blocking(move || crate::password::verify(&typed)).await.unwrap_or(false)
+    };
+    let result = app.auth.lock().unwrap().login(&code, password_ok, &from, Instant::now());
     match result {
-        Login::Ok(token) => {
-            say!("sign-in: a browser from {from}");
+        Login::Ok { token, password } => {
+            say!("sign-in: a browser from {from}{}", if password { ", with the password" } else { "" });
             let new_code = app.auth.lock().unwrap().code().to_string();
             app.status.send_modify(|s| s.code = new_code);
             let mut r = json_resp(StatusCode::OK, json!({"ok": true}));
@@ -247,7 +294,42 @@ async fn login(app: Arc<App>, req: Request<Incoming>, peer: SocketAddr) -> Resp 
     }
 }
 
-async fn websocket(app: Arc<App>, mut req: Request<Incoming>, peer: SocketAddr) -> Resp {
+/// The owner's password (password.rs), set or taken away from a signed-in browser. The phone is told.
+async fn set_password(app: Arc<App>, req: Request<Incoming>, door: Door) -> Resp {
+    if !app.origin_ok(&req) {
+        return respond(StatusCode::FORBIDDEN, "text/plain", "Not from this page");
+    }
+    if app.signed_in(&req).is_none() {
+        return json_resp(StatusCode::UNAUTHORIZED, json!({"ok": false, "error": "Sign in first"}));
+    }
+    let from = who(&req, door);
+    let body = match Limited::new(req.into_body(), 1024).collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return respond(StatusCode::PAYLOAD_TOO_LARGE, "text/plain", "Too long"),
+    };
+    let v = serde_json::from_slice::<Value>(&body).unwrap_or_default();
+    let (result, what) = if v["remove"].as_bool() == Some(true) {
+        (crate::password::remove(), "taken away")
+    } else {
+        // hashing takes a moment: not on the thread that carries the picture
+        let pw = v["password"].as_str().unwrap_or("").to_string();
+        let r = tokio::task::spawn_blocking(move || crate::password::set(&pw)).await;
+        (r.unwrap_or_else(|e| Err(e.to_string())), "set")
+    };
+    match result {
+        Ok(()) => {
+            say!("password {what}, from a browser {from}");
+            let _ = app.asks.send(Ask::Note {
+                title: format!("Remote Desktop's password was {what}"),
+                body: format!("From a browser {from}. If that wasn't you, turn Remote Desktop off."),
+            });
+            json_resp(StatusCode::OK, json!({"ok": true, "password": crate::password::is_set()}))
+        }
+        Err(e) => json_resp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": e})),
+    }
+}
+
+async fn websocket(app: Arc<App>, mut req: Request<Incoming>, door: Door) -> Resp {
     if !app.origin_ok(&req) {
         return respond(StatusCode::FORBIDDEN, "text/plain", "Not from this page");
     }
@@ -259,7 +341,7 @@ async fn websocket(app: Arc<App>, mut req: Request<Incoming>, peer: SocketAddr) 
     if !upgrade || key.is_empty() {
         return respond(StatusCode::BAD_REQUEST, "text/plain", "WebSocket only");
     }
-    let from = who(&req, peer);
+    let from = who(&req, door);
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
     let on_upgrade = hyper::upgrade::on(&mut req);
     let id = app.next_id.fetch_add(1, Ordering::Relaxed) + 1;

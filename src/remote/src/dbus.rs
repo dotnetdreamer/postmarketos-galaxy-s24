@@ -13,12 +13,14 @@ use crate::say;
 pub const NAME: &str = "org.s24.Remote";
 pub const PATH: &str = "/org/s24/Remote";
 
-/// What the bus asks of the daemon.
+/// What the bus (or the door) asks of the daemon.
 #[derive(Debug)]
 pub enum Ask {
     Off,
     Show,
     Copy,
+    /// A notification of its own on the phone (a password changed).
+    Note { title: String, body: String },
 }
 
 pub struct Remote {

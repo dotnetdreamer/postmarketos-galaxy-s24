@@ -4,7 +4,7 @@
 set -u
 . /tmp/s24rt/t.sh
 mkdir -p $T/config $T/data $T/cache $T/xdg
-cp -r /home/user/.config/plasma-mobile $T/xdg/
+rm -rf $T/config/plasma-mobile; cp -r /home/user/.config/plasma-mobile $T/config/
 printf '[General]\nconvergenceModeEnabled=false\n\n[InitialStart]\nwizardRun=true\n' >$T/config/plasmamobilerc
 cat >$T/remote.conf <<CONF
 # s24-remote, for the nested test session

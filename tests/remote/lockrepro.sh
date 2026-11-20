@@ -12,7 +12,7 @@ kwinpid() {
 greeter() { k=$(kwinpid); ps -o pid,ppid,args | awk -v k="$k" '$2 == k && /kscreenlocker_greet/ {print $1}' | head -1; }
 crashes() { grep -c "exit unregular" $T/kwin.log; }
 if ! [ -S /run/user/10000/s24rt-0 ]; then
-    cp -r /home/user/.config/plasma-mobile $T/xdg/
+    rm -rf $T/config/plasma-mobile; cp -r /home/user/.config/plasma-mobile $T/config/
     for f in kscreenlockerrc kdeglobals plasmashellrc; do cp /home/user/.config/$f $T/config/ 2>/dev/null; done
     printf '[General]\nconvergenceModeEnabled=false\n\n[InitialStart]\nwizardRun=true\n' >$T/config/plasmamobilerc
     env -i $base_env dbus-daemon --config-file=$T/bus.conf --fork --print-pid >$T/dbus.pid

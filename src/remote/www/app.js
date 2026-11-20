@@ -85,18 +85,48 @@ async function session() {
   return r.json();
 }
 
+// The code from the phone, or the owner's password (set in Access): this browser remembers which.
+const MODE_KEY = 's24r.signin';
+const LEAD_CODE = $('signin-lead').innerHTML;
+
+function signinMode() {
+  try {
+    return localStorage.getItem(MODE_KEY) === 'password' ? 'password' : 'code';
+  } catch {
+    return 'code';
+  }
+}
+
+function setSigninMode(mode, remember) {
+  const pw = mode === 'password';
+  $('code').hidden = pw;
+  $('pw').hidden = !pw;
+  if (pw) $('signin-lead').textContent = 'Type the password you chose for Remote Desktop.';
+  else $('signin-lead').innerHTML = LEAD_CODE;
+  $('signin-mode').textContent = pw ? 'Use the code from the phone instead' : 'Use your password instead';
+  if (remember) {
+    try { localStorage.setItem(MODE_KEY, mode); } catch { /* private window */ }
+  }
+  (pw ? $('pw') : $('code')).focus();
+}
+
 function showSignIn(info) {
   show('signin');
   const msg = $('signin-msg');
   msg.textContent = info && info.locked
     ? `Too many wrong codes: sign-in is closed for ${Math.ceil(info.locked / 60)} minutes, or until Remote Desktop is turned off and on at the phone.`
     : '';
-  const input = $('code');
-  input.value = '';
-  input.focus();
+  $('code').value = '';
+  $('pw').value = '';
+  setSigninMode(signinMode(), false);
 }
 
-async function signIn(code) {
+$('signin-mode').addEventListener('click', () => {
+  $('signin-msg').textContent = '';
+  setSigninMode($('pw').hidden ? 'password' : 'code', true);
+});
+
+async function signIn(code, how = 'code') {
   const go = $('signin-go');
   const msg = $('signin-msg');
   go.disabled = true;
@@ -115,13 +145,15 @@ async function signIn(code) {
     }
     show('signin');
     if (r.status === 429) {
-      msg.textContent = `Too many wrong codes: sign-in is closed for ${Math.ceil((j.locked || 3600) / 60)} minutes, or until Remote Desktop is turned off and on at the phone.`;
+      msg.textContent = `Too many wrong tries: sign-in is closed for ${Math.ceil((j.locked || 3600) / 60)} minutes, or until Remote Desktop is turned off and on at the phone.`;
+    } else if (how === 'password') {
+      msg.textContent = "That password isn't right.";
     } else if (j.replaced) {
       msg.textContent = 'Too many wrong codes: the phone shows a new one now.';
     } else {
       msg.textContent = `That code isn't right. ${j.left ?? ''} ${j.left === 1 ? 'try' : 'tries'} left before it changes.`;
     }
-    $('code').select();
+    (how === 'password' ? $('pw') : $('code')).select();
   } catch {
     show('signin');
     msg.textContent = "Couldn't reach the phone. Is Remote Desktop still on?";
@@ -132,6 +164,11 @@ async function signIn(code) {
 
 $('signin-form').addEventListener('submit', (e) => {
   e.preventDefault();
+  if (!$('pw').hidden) {
+    const p = $('pw').value;
+    if (p) signIn(p, 'password');
+    return;
+  }
   const code = $('code').value.replace(/\D/g, '');
   if (code.length >= 6) signIn(code);
 });
@@ -582,7 +619,7 @@ function releaseAll(pointerToo) {
   }
 }
 
-const inBar = (el) => el && el.closest && el.closest("#bar");
+const inBar = (el) => el && el.closest && el.closest("#bar, #access");
 const deskKeys = () => !$("desk").hidden && s.ws && !inBar(document.activeElement);
 
 addEventListener('keydown', (e) => {
@@ -729,6 +766,98 @@ $('b-stats').addEventListener('click', () => {
 $('b-bye').addEventListener('click', () => {
   s.closedByUs = true;
   if (s.ws) s.ws.close(1000, 'bye');
+});
+
+// ── access: the phone's addresses, and the owner's password ─────────────
+
+const access = $('access');
+
+async function openAccess() {
+  closeBar();
+  releaseAll(true); // nothing held down on the phone while typing here
+  $('pass1').value = '';
+  $('pass2').value = '';
+  passNote('');
+  access.showModal();
+  $('pass1').focus();
+  try {
+    const j = await session();
+    $('addr-net').textContent = j.url || 'none yet';
+    $('addr-lan').textContent = j.lan || 'none: the phone is on no Wi-Fi';
+    $('pass-remove').hidden = !j.password;
+    $('pass-state').textContent = j.password
+      ? 'You have one: any browser signs in with it. Change it here, or remove it.'
+      : 'Sign in with it from any browser, without the code from the phone.';
+  } catch {
+    passNote("Couldn't reach the phone.");
+  }
+}
+
+async function postPassword(body) {
+  const r = await fetch('/api/password', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  return { ok: r.ok && !!j.ok, error: j.error, password: !!j.password };
+}
+
+$('b-access').addEventListener('click', openAccess);
+$('access-close').addEventListener('click', () => access.close());
+access.addEventListener('close', () => canvas.focus({ preventScroll: true }));
+
+$('access-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const a = $('pass1').value;
+  if (a.length < 8) {
+    passNote('At least 8 characters.');
+    return;
+  }
+  if (a !== $('pass2').value) {
+    passNote("The two don't match.");
+    return;
+  }
+  $('pass-save').disabled = true;
+  try {
+    const r = await postPassword({ password: a });
+    if (r.ok) {
+      $('pass1').value = '';
+      $('pass2').value = '';
+      $('pass-remove').hidden = false;
+      $('pass-state').textContent = 'You have one: any browser signs in with it. Change it here, or remove it.';
+      passNote('Saved. The phone shows a note that it changed.', true);
+    } else {
+      passNote(r.error || "It wasn't saved.");
+    }
+  } catch {
+    passNote("Couldn't reach the phone.");
+  } finally {
+    $('pass-save').disabled = false;
+  }
+});
+
+// A line under the password: red when something is wrong, quiet when it went well.
+function passNote(text, ok = false) {
+  const msg = $('pass-msg');
+  msg.textContent = text;
+  msg.classList.toggle('ok', ok);
+}
+
+$('pass-remove').addEventListener('click', async () => {
+  try {
+    const r = await postPassword({ remove: true });
+    if (r.ok) {
+      $('pass-remove').hidden = true;
+      $('pass-state').textContent = 'Sign in with it from any browser, without the code from the phone.';
+      passNote('Removed: only the code from the phone signs in now.', true);
+    } else {
+      passNote(r.error || "It wasn't removed.");
+    }
+  } catch {
+    passNote("Couldn't reach the phone.");
+  }
 });
 
 function renderStats() {

@@ -70,7 +70,64 @@ body { background: var(--bg); color: var(--text); overflow: hidden; }
   cursor: pointer;
 }
 .card button:disabled { opacity: 0.6; cursor: default; }
+.card input[type="password"] { font: 500 1.15rem/1.3 system-ui, sans-serif; letter-spacing: normal; }
+.card button.link {
+  background: none;
+  color: var(--accent);
+  font-weight: 500;
+  padding: 6px;
+  margin-top: 8px;
+}
 .msg { min-height: 1.4em; margin: 12px 0 0; color: var(--bad); font-size: 0.9rem; }
+
+/* ── access: addresses and the password ──────────────────────────────── */
+#access {
+  width: min(540px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  overflow: auto;
+  background: var(--card);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 22px 22px 16px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.35);
+  user-select: text;
+  -webkit-user-select: text;
+  touch-action: auto;
+}
+#access::backdrop { background: rgba(0, 0, 0, 0.55); }
+#access h2 { font-size: 1.15rem; margin: 0 0 12px; }
+#access h3 { font-size: 1rem; margin: 18px 0 4px; }
+#access .lead { color: var(--muted); margin: 0 0 10px; font-size: 0.9rem; line-height: 1.4; }
+.addrs { margin: 0; }
+.addrs dt { color: var(--muted); font-size: 0.8rem; margin-top: 10px; }
+.addrs dd { margin: 2px 0 0; }
+.addrs dd span { font: 600 0.85rem/1.4 ui-monospace, "SF Mono", Consolas, monospace; overflow-wrap: anywhere; }
+#pass-msg.ok { color: var(--muted); }
+.addrs dd small { display: block; color: var(--muted); font-size: 0.8rem; line-height: 1.35; margin-top: 2px; }
+#access input {
+  width: 100%;
+  font: 500 1rem/1.3 system-ui, sans-serif;
+  padding: 10px 12px;
+  margin-top: 8px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+}
+#access input:focus { outline: 2px solid var(--accent); outline-offset: 1px; }
+#access .row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; margin-top: 12px; }
+#access .row button {
+  padding: 9px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+#access .row button[type="submit"] { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+#access .row #pass-remove { margin-right: auto; color: var(--bad); }
 .mark { display: block; margin: 0 auto; }
 
 /* ── the desktop ─────────────────────────────────────────────────────── */

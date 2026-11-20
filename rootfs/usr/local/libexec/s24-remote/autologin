@@ -1,0 +1,22 @@
+#!/bin/sh
+# greetd's initial_session (once at boot, as the phone's user, without the login screen): the desktop
+# session, locked from its first moment, but only while Remote Desktop is to stay on through a restart
+# (~/.local/state/s24-remote/keep-on, which `s24-remote on` makes and `off` takes away). Otherwise this
+# ends at once and greetd shows the login screen, as without it. See docs/remote-desktop.md.
+#
+# - Locked from the start: kscreenlocker's LockOnStart, from a config folder that only sessions
+#   started here get (KWin reads kscreenlockerrc through XDG_CONFIG_DIRS); the login autostart
+#   (s24-remote login, which sees S24_REMOTE_AUTOLOGIN) locks it too if it somehow isn't
+# - The same session as Plasma Mobile's from the login screen (/usr/share/wayland-sessions/
+#   plasma-mobile.desktop), with the environment the login screen gives it
+# - Without the password typed at login, the wallet (KWallet) isn't opened by itself: the first app
+#   that wants a secret asks for it once
+state="${XDG_STATE_HOME:-$HOME/.local/state}/s24-remote/keep-on"
+[ -e "$state" ] || exit 0
+
+export S24_REMOTE_AUTOLOGIN=1
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=plasma-mobile
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_CONFIG_DIRS="/usr/local/share/s24-remote/autologin-xdg${XDG_CONFIG_DIRS:+:$XDG_CONFIG_DIRS}"
+exec /usr/lib/libexec/plasma-dbus-run-session-if-needed /usr/bin/startplasmamobile

@@ -4,7 +4,7 @@
 T=/tmp/s24rt
 base_env="HOME=/home/user PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin USER=user LANG=C.UTF-8
 XDG_RUNTIME_DIR=/run/user/10000 XDG_CONFIG_HOME=$T/config XDG_DATA_HOME=$T/data XDG_CACHE_HOME=$T/cache
-XDG_CONFIG_DIRS=$T/xdg/plasma-mobile:/etc/xdg DBUS_SESSION_BUS_ADDRESS=unix:path=$T/bus
+XDG_CONFIG_DIRS=$T/config/plasma-mobile:/etc/xdg DBUS_SESSION_BUS_ADDRESS=unix:path=$T/bus
 XDG_CURRENT_DESKTOP=KDE KDE_FULL_SESSION=true KDE_SESSION_VERSION=6 XDG_SESSION_TYPE=wayland"
 client_env="$base_env WAYLAND_DISPLAY=s24rt-0 QT_QPA_PLATFORM=wayland GDK_BACKEND=wayland GSK_RENDERER=cairo
 KSCREEN_BACKEND_INPROCESS=1 PLASMA_PLATFORM=phone:handset PLASMA_DEFAULT_SHELL=org.kde.plasma.mobileshell

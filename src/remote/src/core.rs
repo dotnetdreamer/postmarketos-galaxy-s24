@@ -93,6 +93,8 @@ pub struct Core {
     encoder: String,
     last_lock_look: Instant,
     last_sync: Instant,
+    /// The second screen's panels looked after (panels.rs), once a run.
+    panels_done: bool,
 }
 
 const HELPER_NAME: &str = "S24Remote";
@@ -128,6 +130,7 @@ impl Core {
             encoder: String::new(),
             last_lock_look: now,
             last_sync: now,
+            panels_done: false,
         }
     }
 
@@ -461,6 +464,11 @@ impl Core {
                 say!("helper: ready, screen {} ({})", v["output"].as_str().unwrap_or("?"), self.encoder);
                 if let Some(vw) = &self.viewer {
                     vw.text(json!({"t": "state", "state": "running"}));
+                }
+                // While both screens are there: each gets Plasma Mobile's panels (the phone stays a phone).
+                if !self.panels_done {
+                    self.panels_done = true;
+                    crate::panels::ensure(&self.bus).await;
                 }
                 self.phone_screen().await;
             }

@@ -7,6 +7,9 @@
 //!   tunnel_token = …         a named tunnel's token (cloudflared tunnel token NAME)
 //!   hostname = desk.example.org   that tunnel's public name, to show and to accept
 //!   grace_minutes = 5        how long the desktop waits for a browser that went away
+//!   lan = on                 on: also https://<the phone's address>:lan_port on Wi-Fi (and the USB
+//!                            cable's network), with the phone's own certificate; off: the tunnel only
+//!   lan_port = 7443          (the firewall rule opens 7443 on Wi-Fi and USB networks)
 //!   phone_screen = off       off: the phone's own screen is off while a browser is connected
 //!                            on: left as it is
 //!   helper = /path           openandroiddex-pmos (default: the first one found, see HELPERS)
@@ -33,6 +36,8 @@ pub struct Config {
     pub hostname: Option<String>,
     pub grace_secs: u64,
     pub phone_screen_off: bool,
+    pub lan: bool,
+    pub lan_port: u16,
     pub helper: PathBuf,
     pub cloudflared: PathBuf,
 }
@@ -62,6 +67,8 @@ impl Config {
             hostname: None,
             grace_secs: 5 * 60,
             phone_screen_off: true,
+            lan: true,
+            lan_port: 7443,
             helper: HELPERS
                 .iter()
                 .map(|p| expand(p))
@@ -89,6 +96,8 @@ impl Config {
                 "hostname" if !v.is_empty() => c.hostname = Some(v.to_lowercase()),
                 "grace_minutes" => c.grace_secs = v.parse::<u64>().map(|m| m * 60).unwrap_or(c.grace_secs),
                 "phone_screen" => c.phone_screen_off = v != "on",
+                "lan" => c.lan = v != "off",
+                "lan_port" => c.lan_port = v.parse().ok().filter(|p| *p > 0).unwrap_or(c.lan_port),
                 "helper" => c.helper = expand(v),
                 "cloudflared" => c.cloudflared = expand(v),
                 _ => {}
@@ -118,19 +127,23 @@ mod tests {
         assert_eq!(c.tunnel, Tunnel::Quick);
         assert_eq!(c.grace_secs, 300);
         assert!(c.phone_screen_off);
+        assert!(c.lan);
+        assert_eq!(c.lan_port, 7443);
     }
 
     #[test]
     fn keys() {
         let c = Config::parse(
             "# comment\nport = 9000\ntunnel = token\ntunnel_token = abc\nhostname = Desk.Example.org\n\
-             grace_minutes = 2\nphone_screen = on\nnonsense\n",
+             grace_minutes = 2\nphone_screen = on\nlan = off\nlan_port = 8443\nnonsense\n",
         );
         assert_eq!(c.port, 9000);
         assert_eq!(c.tunnel, Tunnel::Token { token: "abc".into() });
         assert_eq!(c.hostname.as_deref(), Some("desk.example.org"));
         assert_eq!(c.grace_secs, 120);
         assert!(!c.phone_screen_off);
+        assert!(!c.lan);
+        assert_eq!(c.lan_port, 8443);
     }
 
     #[test]

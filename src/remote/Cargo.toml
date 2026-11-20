@@ -1,6 +1,6 @@
 [package]
 name = "s24-remote"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 license = "MIT"
 description = "The phone's desktop in any browser, from anywhere: a tunnel, a door with a code, and the picture"
@@ -17,6 +17,13 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
 serde_json = "1.0.154"
 libc = "0.2.191"
+# The Wi-Fi door's HTTPS, its certificate, the password's hash (ring: C and assembly, so this
+# builds on the phone, or wherever an aarch64 C compiler is)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+ring = "0.17"
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = 3

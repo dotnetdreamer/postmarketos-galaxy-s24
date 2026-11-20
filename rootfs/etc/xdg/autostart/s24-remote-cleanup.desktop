@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
-Name=Remote Desktop cleanup
-Comment=Gives the phone its screen back if a Remote Desktop session ended without doing so
-Exec=/usr/local/bin/s24-remote cleanup
+Name=Remote Desktop at login
+Comment=Gives the phone its screen back if a Remote Desktop session ended without doing so, and turns Remote Desktop on again if it was on
+Exec=/usr/local/bin/s24-remote login
 NoDisplay=true
 OnlyShowIn=KDE;

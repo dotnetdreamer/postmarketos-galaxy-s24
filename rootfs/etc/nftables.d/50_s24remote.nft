@@ -1,0 +1,14 @@
+#!/usr/sbin/nft -f
+# Remote Desktop's Wi-Fi address (s24-remote, docs/remote-desktop.md): port 7443 open on Wi-Fi, the
+# USB cable's network and wired networks (a USB-C hub's Ethernet), never on mobile data, where the
+# phone can have an address the whole internet reaches. Nothing listens there while Remote Desktop
+# is off, and sign-in needs the code shown on the phone or the owner's password.
+
+table inet filter {
+	chain input {
+		iifname "wlan*" tcp dport 7443 accept comment "Remote Desktop on Wi-Fi"
+		iifname "usb*" tcp dport 7443 accept comment "Remote Desktop on the USB cable's network"
+		iifname "eth*" tcp dport 7443 accept comment "Remote Desktop on a wired network"
+		iifname "en*" tcp dport 7443 accept comment "Remote Desktop on a wired network"
+	}
+}

@@ -17,11 +17,15 @@
   <form id="signin-form" class="card" autocomplete="off">
     <img src="icon.svg" alt="" class="mark" width="48" height="48">
     <h1>Your phone's desktop</h1>
-    <p class="lead">Type the code from the <b>Remote Desktop</b> notification on your phone.</p>
+    <p class="lead" id="signin-lead">Type the code from the <b>Remote Desktop</b> notification on your phone.</p>
     <label for="code" class="sr">Code</label>
     <input id="code" name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="9"
-           placeholder="1234 5678" pattern="[0-9 ]*" required>
+           placeholder="1234 5678" pattern="[0-9 ]*">
+    <label for="pw" class="sr">Password</label>
+    <input id="pw" name="password" type="password" autocomplete="current-password" maxlength="128"
+           placeholder="Your password" hidden>
     <button id="signin-go" type="submit">Connect</button>
+    <button id="signin-mode" type="button" class="link">Use your password instead</button>
     <p id="signin-msg" class="msg" role="alert"></p>
   </form>
 </main>
@@ -51,8 +55,33 @@
     <button id="b-clip" aria-pressed="false" title="Share the clipboard with the phone">Clipboard</button>
     <button id="b-phone" aria-pressed="false" title="The phone's own screen while you're connected">Phone screen</button>
     <button id="b-stats" aria-pressed="false" title="Speed and delay">Info</button>
+    <button id="b-access" title="This phone's addresses, and a password of your own">Access</button>
     <button id="b-bye" title="Disconnect">Disconnect</button>
   </nav>
+
+  <dialog id="access" aria-labelledby="access-title">
+    <form id="access-form" method="dialog">
+      <h2 id="access-title">Reaching this desktop</h2>
+      <dl class="addrs">
+        <dt>From anywhere</dt>
+        <dd><span id="addr-net">…</span><small>A new address each time Remote Desktop starts.</small></dd>
+        <dt>On the phone's Wi-Fi</dt>
+        <dd><span id="addr-lan">…</span><small>Faster, and nothing goes through the internet. The browser warns once about the phone's own certificate: continue.</small></dd>
+      </dl>
+      <h3>Your own password</h3>
+      <p id="pass-state" class="lead">Sign in with it from any browser, without the code from the phone.</p>
+      <label for="pass1" class="sr">New password</label>
+      <input id="pass1" type="password" autocomplete="new-password" maxlength="128" placeholder="New password (8 characters or more)">
+      <label for="pass2" class="sr">The new password again</label>
+      <input id="pass2" type="password" autocomplete="new-password" maxlength="128" placeholder="Again">
+      <p id="pass-msg" class="msg" role="alert"></p>
+      <div class="row">
+        <button type="button" id="pass-remove" hidden>Remove the password</button>
+        <button type="button" id="access-close">Close</button>
+        <button type="submit" id="pass-save">Save the password</button>
+      </div>
+    </form>
+  </dialog>
 
   <div id="stats" hidden></div>
   <div id="banner" hidden></div>

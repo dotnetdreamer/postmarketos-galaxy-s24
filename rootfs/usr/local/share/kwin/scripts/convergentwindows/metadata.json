@@ -1,0 +1,18 @@
+{
+    "KPackageStructure": "KWin/Script",
+    "KPlugin": {
+        "Authors": [
+            {
+                "Email": "plata.hill@kdemail.net",
+                "Name": "Plata Hill"
+            }
+        ],
+        "Description": "Plasma Mobile's window rules, per screen: phone windows on the phone's panel, desktop windows on the others (Galaxy S24).",
+        "Icon": "preferences-system-windows",
+        "Id": "convergentwindows",
+        "License": "LGPL-2.1-or-later",
+        "Name": "Convergent Windows",
+        "Website": "https://github.com/dotnetdreamer/postmarketos-galaxy-s24"
+    },
+    "X-Plasma-API": "declarativescript"
+}

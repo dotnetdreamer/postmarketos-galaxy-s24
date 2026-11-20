@@ -1,0 +1,4 @@
+# Read only by sessions started by /usr/local/libexec/s24-remote/autologin (it puts this folder in
+# XDG_CONFIG_DIRS): the phone logged in by itself, so the session is locked from the start.
+[Daemon]
+LockOnStart=true

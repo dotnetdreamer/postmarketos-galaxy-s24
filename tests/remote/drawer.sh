@@ -5,7 +5,7 @@
 mkdir -p $T/config $T/data $T/cache $T/xdg $T/run
 chmod 700 $T/run
 if ! [ -S /run/user/10000/s24rt-0 ]; then
-    cp -r /home/user/.config/plasma-mobile $T/xdg/
+    rm -rf $T/config/plasma-mobile; cp -r /home/user/.config/plasma-mobile $T/config/
     printf '[General]\nconvergenceModeEnabled=false\n\n[InitialStart]\nwizardRun=true\n' >$T/config/plasmamobilerc
     printf 'port = 7182\ntunnel = none\n' >$T/drawer.conf
     env -i $base_env dbus-daemon --config-file=$T/bus.conf --fork --print-pid >$T/dbus.pid

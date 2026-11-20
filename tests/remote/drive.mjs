@@ -1,18 +1,20 @@
-// drive.mjs: a headless Edge kept open and driven step by step over HTTP on loopback, for testing
-// s24-remote's page through the real tunnel (Claude, 2026-11-19). Input goes in as CDP Input events:
-// trusted events, through the page's own handlers.
+// drive.mjs: an Edge kept open and driven step by step over HTTP on loopback, for testing
+// s24-remote's page through the real tunnel or the Wi-Fi door (Claude, 2026-11-19). Input goes in as
+// CDP Input events: trusted events, through the page's own handlers. Headless unless `visible` is
+// given: then a real window on the screen, at the size asked for, that someone can watch.
 //
-//   node drive.mjs <edge exe> <work dir> <control port> [WxH]
+//   node drive.mjs <edge exe> <work dir> <control port> [WxH] [visible]
 //   /open?url=  /state  /code?c=  /click?x=&y=&b=&n=  /move?x=&y=  /drag?x1&y1&x2&y2&steps
 //   /type?text=  /key?key=&code=&vk=&mod=  /wheel?x=&y=&dy=&dx=  /js?e=  /shot?name=
-//   /size?w=&h=  /grant  /errors  /quit
+//   /size?w=&h=  /grant  /errors  /quit  /proceed (past a certificate warning)  /init?js=
 import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 
-const [exe, work, ctlPortArg, sizeArg] = process.argv.slice(2);
+const [exe, work, ctlPortArg, sizeArg, modeArg] = process.argv.slice(2);
+const visible = modeArg === 'visible';
 const [W, H] = (sizeArg || '1600x900').split('x').map(Number);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const freePort = () => new Promise((resolve) => {
@@ -23,8 +25,9 @@ fs.mkdirSync(path.join(work, 'shots'), { recursive: true });
 
 const cdpPort = await freePort();
 const profile = path.join(work, `profile-${cdpPort}`);
-const proc = spawn(exe, ['--headless=new', `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profile}`, '--no-first-run',
-  '--no-default-browser-check', '--disable-extensions', `--window-size=${W},${H}`, 'about:blank'], { stdio: 'ignore' });
+const proc = spawn(exe, [...(visible ? [] : ['--headless=new']), `--remote-debugging-port=${cdpPort}`, `--user-data-dir=${profile}`,
+  '--no-first-run', '--no-default-browser-check', '--disable-extensions', `--window-size=${W},${H}`, '--window-position=40,40',
+  'about:blank'], { stdio: 'ignore' });
 function killBrowser() {
   try { proc.kill(); } catch { /* gone */ }
   spawnSync('powershell', ['-NoProfile', '-Command',
@@ -58,8 +61,11 @@ const js = async (expression) => {
 };
 await cdp('Page.enable');
 await cdp('Runtime.enable');
-await cdp('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 1, mobile: false });
-await cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
+if (!visible) {
+  // a visible window keeps its own size and focus, as a person's would
+  await cdp('Emulation.setDeviceMetricsOverride', { width: W, height: H, deviceScaleFactor: 1, mobile: false });
+  await cdp('Emulation.setFocusEmulationEnabled', { enabled: true });
+}
 
 const STATE = `(() => {
   const $ = (i) => document.getElementById(i);
@@ -167,6 +173,20 @@ const server = http.createServer(async (req, res) => {
         await sleep(30);
         await cdp('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
         return send({ ok: true });
+      }
+      case '/proceed': {
+        // Chrome's "Your connection isn't private" page (the Wi-Fi door's own certificate): Advanced,
+        // then Continue, as a person would click them
+        const before = await js('location.href');
+        const clicked = await js(`(() => { const d = document.getElementById('details-button'); if (d) d.click();
+          const p = document.getElementById('proceed-link'); if (p) { p.click(); return true; } return false; })()`);
+        await sleep(Number(p.wait || 2500));
+        return send({ before, clicked, after: await js('location.href'), state: await js(STATE) });
+      }
+      case '/init': {
+        // a script run in every page before its own (Page.addScriptToEvaluateOnNewDocument)
+        const r = await cdp('Page.addScriptToEvaluateOnNewDocument', { source: p.js });
+        return send({ result: r.result || r.error });
       }
       case '/grant': {
         // clipboard permissions for the page's origin (a real browser asks the person once)

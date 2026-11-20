@@ -10,8 +10,14 @@
 #   3. installs the screen helper, Open Android DeX's openandroiddex-pmos (version 7 or later lets
 #      Low quality go below 2 Mbit/s): the path given, else the copy the Open Android DeX app put
 #      in a user's home. Without it, Remote Desktop can sign browsers in but has no picture
-#   4. installs the quick setting, the desktop files and the login cleanup, and puts the quick
+#   4. installs the quick setting, the desktop files and the login autostart, and puts the quick
 #      setting next to Mouse Mode in the user's drawer
+#   5. the phone's screen as a phone beside the browser's: Plasma Mobile's window script, decided per
+#      screen (rootfs/usr/local/share/kwin/scripts/convergentwindows), swapped into a running KWin
+#   6. the Wi-Fi address: the firewall rule for port 7443 (Wi-Fi, USB and wired networks only)
+#   7. on through a restart: greetd starts the desktop by itself at boot (locked), but only while
+#      Remote Desktop is to stay on (/usr/local/libexec/s24-remote/autologin); otherwise the login
+#      screen as before. S24_REMOTE_NO_AUTOLOGIN=1 leaves greetd alone
 # env: DESTDIR=/some/dir    install under that prefix instead of / (a dry run)
 #      S24_REMOTE_BIN=path  a prebuilt s24-remote (aarch64)
 # Files are copied beside their target and renamed into place, never written over: a running
@@ -80,14 +86,34 @@ else
 		"(openandroiddex-pmos/build.sh) and run this again with its path" >&2
 fi
 
-# 4. the quick setting, desktop files, login cleanup
+# 4. the quick setting, desktop files, login autostart; 5. the window script; 6. the firewall rule;
+# 7. the automatic login's pieces
 for f in usr/share/plasma/quicksettings/org.s24.quicksetting.remote/metadata.json \
 	usr/share/plasma/quicksettings/org.s24.quicksetting.remote/contents/ui/main.qml \
 	usr/local/share/applications/org.s24.remote.desktop \
 	usr/local/share/applications/org.s24.remote-helper.desktop \
-	etc/xdg/autostart/s24-remote-cleanup.desktop; do
+	etc/xdg/autostart/s24-remote-cleanup.desktop \
+	usr/local/share/kwin/scripts/convergentwindows/metadata.json \
+	usr/local/share/kwin/scripts/convergentwindows/contents/ui/main.qml \
+	etc/nftables.d/50_s24remote.nft \
+	usr/local/share/s24-remote/autologin-xdg/kscreenlockerrc; do
 	put "rootfs/$f" "/$f" 0644
 done
+put rootfs/usr/local/libexec/s24-remote/autologin /usr/local/libexec/s24-remote/autologin 0755
+
+if [ -z "$D" ]; then
+	# 6. the firewall rule, now. The Galaxy S24's kernel has no nftables (no firewall at all): there
+	# s24-remote's Wi-Fi door takes only local-network connections by itself (src/remote/src/lan.rs)
+	if command -v nft >/dev/null && nft list tables >/dev/null 2>&1; then
+		if rc-service nftables reload >/dev/null 2>&1 || nft -f /etc/nftables.nft >/dev/null 2>&1; then
+			echo "the firewall lets Wi-Fi and USB networks reach port 7443"
+		else
+			echo "note: the firewall wasn't reloaded" >&2
+		fi
+	else
+		echo "this kernel has no nftables (no firewall): the Wi-Fi door takes only local-network connections by itself"
+	fi
+fi
 
 # Next to Mouse Mode in the drawer (Plasma Mobile would put a new one last), for the user who ran sudo.
 user=${SUDO_USER:-}
@@ -105,5 +131,33 @@ if [ -z "$D" ] && [ -n "$user" ] && [ "$user" != root ]; then
 		esac
 		kwriteconfig6 --file plasmamobilerc --group QuickSettings --key enabledQuickSettings "$new"
 	' && echo "put Remote Desktop in $user's drawer"
+fi
+# 7. greetd: the desktop by itself at boot while Remote Desktop is to stay on (autologin decides)
+greetd_conf=$D/etc/phrog/greetd-config.toml
+if [ -n "$user" ] && [ "$user" != root ] && [ -z "${S24_REMOTE_NO_AUTOLOGIN:-}" ] && [ -f "$greetd_conf" ]; then
+	if grep -q '^\[initial_session\]' "$greetd_conf"; then
+		echo "greetd has an initial_session already: left as it is ($greetd_conf)"
+	else
+		cp "$greetd_conf" "$greetd_conf.s24new"
+		printf '\n# Remote Desktop (s24-remote): the desktop at boot without the login screen, locked, only while\n# Remote Desktop is to stay on; otherwise autologin ends at once and the login screen shows.\n[initial_session]\ncommand = "/usr/local/libexec/s24-remote/autologin"\nuser = "%s"\n' "$user" >>"$greetd_conf.s24new"
+		mv -f "$greetd_conf.s24new" "$greetd_conf"
+		echo "greetd: the desktop starts by itself at boot (locked) while Remote Desktop stays on"
+	fi
+fi
+
+# 5. the window script into the running session, if there is one (else from the next login)
+if [ -z "$D" ] && [ -n "$user" ] && [ "$user" != root ]; then
+	for p in $(pgrep -x plasmashell); do
+		# the desktop session's own (in a logind session's cgroup), not a test copy
+		grep -q '^0::/c[0-9]*$' /proc/$p/cgroup 2>/dev/null || continue
+		[ "$(stat -c %U /proc/$p)" = "$user" ] || continue
+		bus=$(tr '\0' '\n' </proc/$p/environ | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')
+		[ -n "$bus" ] || continue
+		su "$user" -s /bin/sh -c "export DBUS_SESSION_BUS_ADDRESS='$bus'
+			qdbus6 org.kde.KWin /Scripting org.kde.kwin.Scripting.unloadScript convergentwindows >/dev/null 2>&1
+			qdbus6 org.kde.KWin /KWin org.kde.KWin.reconfigure >/dev/null 2>&1" &&
+			echo "the window script is in the running session"
+		break
+	done
 fi
 echo "done: the quick setting appears after the next login"

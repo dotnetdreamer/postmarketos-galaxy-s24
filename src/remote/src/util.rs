@@ -79,6 +79,37 @@ pub fn cache_dir() -> PathBuf {
     base.join("s24-remote")
 }
 
+/// ~/.local/share/s24-remote: kept between runs (the Wi-Fi certificate, the password's hash).
+pub fn data_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local/share"));
+    base.join("s24-remote")
+}
+
+/// ~/.local/state/s24-remote: whether Remote Desktop stays on through a restart.
+pub fn state_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join(".local/state"));
+    base.join("s24-remote")
+}
+
+/// Written whole, readable by this user only (0600 from the start, never briefly wider).
+pub fn write_private(path: &PathBuf, data: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let _ = fs::remove_file(&tmp);
+    let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    drop(f);
+    fs::rename(&tmp, path)
+}
+
 pub fn config_file() -> PathBuf {
     if let Some(p) = std::env::var_os("S24_REMOTE_CONFIG") {
         return PathBuf::from(p);

@@ -1,16 +1,21 @@
 //! s24-remote: the phone's desktop in any browser, from anywhere.
 //!
-//!   s24-remote on | off | toggle     what the Remote Desktop quick setting runs
-//!   s24-remote status [--json]       on or off, the address and the code
+//!   s24-remote on | off | toggle     what the Remote Desktop quick setting runs. On stays on
+//!                                    through a restart, until it is turned off
+//!   s24-remote status [--json]       on or off, the addresses and the code
 //!   s24-remote show                  the notification with the address and code, again
+//!   s24-remote password [--remove]   the owner's password, set at the phone (password.rs)
 //!   s24-remote serve                 the program itself (what `on` starts, in the background)
-//!   s24-remote cleanup               at login: the phone's screen back if a run left it off
+//!   s24-remote login                 at login: the phone's screen back if a run left it off, and
+//!                                    Remote Desktop on again if it was on
+//!   s24-remote cleanup               the first half of that only
 //!
-//! While it is on: a tunnel to the internet (tunnel.rs), a door on 127.0.0.1 that only opens to
-//! the code shown on the phone (http.rs, auth.rs), and once a browser is in, a screen of its own
-//! on the phone's desktop in docked mode, encoded as H.264 by Open Android DeX's postmarketOS
-//! helper and paced to the browser's link (core.rs, flow.rs). The phone stays awake while it is
-//! on (logind), and its own screen is off while a browser is connected (phone.rs).
+//! While it is on: a tunnel to the internet (tunnel.rs) and a door on the phone's Wi-Fi address
+//! (lan.rs), both to the same sign-in that opens to the code shown on the phone or the owner's
+//! password (http.rs, auth.rs); once a browser is in, a screen of its own on the phone's desktop in
+//! docked mode, encoded as H.264 by Open Android DeX's postmarketOS helper and paced to the
+//! browser's link (core.rs, flow.rs). The phone stays awake while it is on (logind), and its own
+//! screen is off while a browser is connected (phone.rs) unless asked for.
 
 mod auth;
 mod config;
@@ -20,6 +25,9 @@ mod flow;
 mod h264;
 mod helper;
 mod http;
+mod lan;
+mod panels;
+mod password;
 mod phone;
 mod status;
 mod tunnel;
@@ -50,6 +58,21 @@ fn status_file() -> std::path::PathBuf {
     util::runtime_dir().join("status.json")
 }
 
+/// There while Remote Desktop is to stay on: `on` makes it, `off` (or Turn off) takes it away, and
+/// the login autostart (and the phone's automatic login, see autologin) start it again while it is.
+fn keep_on_file() -> std::path::PathBuf {
+    util::state_dir().join("keep-on")
+}
+
+fn keep_on(on: bool) {
+    let f = keep_on_file();
+    if on {
+        let _ = util::write_atomic(&f, "Remote Desktop stays on through a restart: `s24-remote off` ends it\n");
+    } else {
+        let _ = std::fs::remove_file(f);
+    }
+}
+
 /// The running copy's pid, if there is one (and it really is us).
 fn running_pid() -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(pid_file()).ok()?.trim().parse().ok()?;
@@ -63,15 +86,25 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     let code = match args.get(1).map(String::as_str).unwrap_or("status") {
         "serve" => tokio_main(serve()),
-        "on" => on(),
-        "off" => off(),
+        "on" => {
+            keep_on(true);
+            on()
+        }
+        "off" => {
+            keep_on(false);
+            off()
+        }
         "toggle" => {
             if running_pid().is_some() {
+                keep_on(false);
                 off()
             } else {
+                keep_on(true);
                 on()
             }
         }
+        "login" => tokio_main(login()),
+        "password" => set_password(args.get(2).map(String::as_str) == Some("--remove")),
         "status" => status(args.get(2).map(String::as_str) == Some("--json")),
         "show" => match running_pid() {
             Some(pid) => {
@@ -95,7 +128,7 @@ fn main() -> ExitCode {
             0
         }
         _ => {
-            eprintln!("usage: s24-remote on | off | toggle | status [--json] | show | serve | cleanup | version");
+            eprintln!("usage: s24-remote on | off | toggle | status [--json] | show | password [--remove] | serve | login | cleanup | version");
             2
         }
     };
@@ -170,6 +203,9 @@ fn status(as_json: bool) -> i32 {
     if let Some(u) = v["url"].as_str() {
         println!("address: {u}");
     }
+    if let Some(u) = v["lan"].as_str() {
+        println!("on this Wi-Fi: {u}");
+    }
     if let Some(c) = v["code"].as_str() {
         println!("code: {}", spaced(c));
     }
@@ -181,18 +217,111 @@ fn status(as_json: bool) -> i32 {
 
 /// The text of the notification that hands out the address.
 fn note_text(s: &Status) -> (String, String) {
-    match (&s.state, &s.url) {
-        (State::Error, _) => ("Remote Desktop can't be reached".into(), s.message.clone()),
-        (_, None) => ("Remote Desktop is starting".into(), "Getting an address on the internet…".into()),
-        (_, Some(url)) if s.locked_secs > 0 => (
+    let code = spaced(&s.code);
+    let wifi = s.lan_url.as_deref();
+    if s.locked_secs > 0 {
+        return (
             "Remote Desktop: sign-in closed".into(),
-            format!("Too many wrong codes were typed at {url}. Turn Remote Desktop off and on to open it again."),
-        ),
-        (_, Some(url)) => (
-            "Remote Desktop is on".into(),
-            format!("Open {url} in any browser and type the code {}", spaced(&s.code)),
-        ),
+            "Too many wrong codes were typed. Turn Remote Desktop off and on to open it again.".into(),
+        );
     }
+    match (&s.state, &s.url, wifi) {
+        (_, Some(url), Some(l)) => (
+            "Remote Desktop is on".into(),
+            format!("Open {url} in any browser (on this Wi-Fi: {l}) and type the code {code}"),
+        ),
+        (_, Some(url), None) => ("Remote Desktop is on".into(), format!("Open {url} in any browser and type the code {code}")),
+        (State::Error, None, Some(l)) => (
+            "Remote Desktop: on this Wi-Fi only".into(),
+            format!("Open {l} and type the code {code}. Not on the internet: {}", s.message),
+        ),
+        (_, None, Some(l)) => (
+            "Remote Desktop is on".into(),
+            format!("On this Wi-Fi: open {l} and type the code {code}. Getting an address on the internet…"),
+        ),
+        (State::Error, None, None) => ("Remote Desktop can't be reached".into(), s.message.clone()),
+        (_, None, None) => ("Remote Desktop is starting".into(), "Getting an address on the internet…".into()),
+    }
+}
+
+/// At login (the autostart): the phone's screen back if a run left it off; Remote Desktop on again
+/// if it is to stay on. After the phone's automatic login (autologin) the session must be locked:
+/// kscreenlocker's LockOnStart does it, and this makes sure.
+async fn login() -> i32 {
+    util::log_open();
+    if running_pid().is_none() {
+        phone::cleanup().await;
+    }
+    if std::env::var_os("S24_REMOTE_AUTOLOGIN").is_some() {
+        if let Ok(bus) = zbus::Connection::session().await {
+            if phone::locked(&bus).await != Some(true) {
+                say!("login: an automatic login that isn't locked: locking it");
+                phone::lock(&bus).await;
+            }
+        }
+    }
+    if keep_on_file().exists() && running_pid().is_none() {
+        say!("login: Remote Desktop was on: on again");
+        return on();
+    }
+    0
+}
+
+/// `s24-remote password`: the owner's password, typed twice at the phone (not shown).
+fn set_password(remove: bool) -> i32 {
+    if remove {
+        return match password::remove() {
+            Ok(()) => {
+                println!("The password is gone: only the code shown on the phone signs in now");
+                0
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                1
+            }
+        };
+    }
+    let first = read_hidden("New password: ");
+    if let Err(e) = password::check_new(&first) {
+        eprintln!("{e}");
+        return 1;
+    }
+    if read_hidden("Again: ") != first {
+        eprintln!("They don't match: the password is as it was");
+        return 1;
+    }
+    match password::set(&first) {
+        Ok(()) => {
+            println!("Set: a browser can sign in with it, or with the code shown on the phone");
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
+}
+
+/// A line from the terminal with echo off (from stdin as it is, when that isn't a terminal).
+fn read_hidden(prompt: &str) -> String {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let fd = 0;
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let tty = unsafe { libc::tcgetattr(fd, &mut old) } == 0;
+    if tty {
+        let mut quiet = old;
+        quiet.c_lflag &= !libc::ECHO;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    }
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    if tty {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
+        eprintln!();
+    }
+    line.trim_end_matches(['\n', '\r']).to_string()
 }
 
 async fn serve() -> i32 {
@@ -246,8 +375,16 @@ async fn serve() -> i32 {
         core: ev_tx.clone(),
         next_id: AtomicU64::new(0),
         hostname: cfg.hostname.clone(),
+        machine: lan::machine_name(),
+        asks: ask_tx.clone(),
     });
     tokio::spawn(http::serve(app.clone(), listener));
+    // The Wi-Fi door: the same sign-in on the phone's own address, for a computer on this network.
+    if cfg.lan {
+        if let Err(e) = lan::start(app.clone(), cfg.lan_port).await {
+            say!("wi-fi: not open: {e}");
+        }
+    }
 
     // Awake while on: asleep, the phone is off the internet and nothing a browser sends wakes it.
     let sleep_lock = dbus::inhibit_sleep().await;
@@ -318,7 +455,15 @@ async fn serve() -> i32 {
                 }
             }
             ask = asks.recv() => match ask {
-                Some(dbus::Ask::Off) | None => break,
+                None => break,
+                Some(dbus::Ask::Off) => {
+                    // Turn off, in the notification: off for good, not only until the next restart
+                    keep_on(false);
+                    break;
+                }
+                Some(dbus::Ask::Note { title, body }) => {
+                    bus.notify(0, &title, &body, &[], false).await;
+                }
                 Some(dbus::Ask::Show) => {
                     let s = status.borrow().clone();
                     let text = note_text(&s);
